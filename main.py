@@ -1,11 +1,13 @@
-import calendar, hashlib, json, os, re, sys, time
+import calendar, hashlib, json, os, re, sys, time, warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 import feedparser
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 OLLAMA = "http://127.0.0.1:11434"
@@ -18,6 +20,7 @@ TIME_BUDGET = 40 * 60
 TOPIC_WINDOW = 30 * 86400  # a topic is blocked from repeating for 30 days
 ITEM_AGE = 72 * 3600
 MIN_WORDS = 200
+BLOGGER_SCOPE = "https://www.googleapis.com/auth/blogger"
 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
@@ -135,6 +138,7 @@ def load_state():
     st.setdefault("seen", [])
     st.setdefault("fails", 0)
     st.setdefault("topics", [])
+    st.setdefault("write_ok", False)
     return st
 
 
@@ -181,14 +185,18 @@ def record_topic(st, cat, member_titles, gen_title):
 
 
 # ---------------- Blogger ----------------
-def access_token():
+def token_info():
     r = S.post("https://oauth2.googleapis.com/token", data={
         "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
         "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
     }, timeout=30)
     if r.status_code != 200:
         raise PostError(f"token error {r.status_code}: {r.text[:300]}")
-    return r.json()["access_token"]
+    return r.json()
+
+
+def access_token():
+    return token_info()["access_token"]
 
 
 def hint_for(text):
@@ -198,10 +206,12 @@ def hint_for(text):
                 "expire after 7 days: set the app to 'In production' and create a new refresh token.")
     if "invalid_client" in t:
         return "CLIENT_ID or CLIENT_SECRET is wrong (or not from the same OAuth client that created the refresh token)."
+    if "permission" in t or "forbidden" in t or "insufficient" in t or "scope" in t:
+        return ("The token can read the blog but cannot write. Create a NEW refresh token with the scope "
+                f"{BLOGGER_SCOPE} (not .readonly), using the Google account that owns or is an Author/Admin of this blog, "
+                "then update the REFRESH_TOKEN secret.")
     if "accessnotconfigured" in t or "has not been used" in t or "disabled" in t:
         return "Blogger API v3 is not enabled. Google Cloud Console -> APIs & Services -> Library -> enable 'Blogger API v3'."
-    if "insufficient" in t or "scope" in t:
-        return "The refresh token was created without the scope https://www.googleapis.com/auth/blogger. Create a new token with that scope."
     if "404" in t or "notfound" in t:
         return "BLOG_ID is wrong, or this Google account has no access to that blog."
     return "Check the secrets CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN and BLOG_ID."
@@ -219,128 +229,25 @@ def blogger_post(title, content, label):
     return r.json().get("url")
 
 
-def preflight():
-    # 1) local AI
-    try:
-        r = S.get(f"{OLLAMA}/api/tags", timeout=10)
-        names = [m.get("name", "") for m in r.json().get("models", [])]
-        if not any(MODEL.split(":")[0] in n for n in names):
-            fatal(f"AI model '{MODEL}' is not installed in Ollama. Installed: {names}")
-        log("Ollama OK:", names)
-    except SystemExit:
-        raise
-    except Exception as ex:
-        fatal(f"Local AI (Ollama) is not reachable: {ex}")
-    # 2) Blogger credentials + blog id
-    try:
-        tok = access_token()
-    except PostError as ex:
-        fatal(f"{ex} | HOW TO FIX: {hint_for(str(ex))}")
-    r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}",
-              headers={"Authorization": f"Bearer {tok}"}, timeout=30)
-    if r.status_code != 200:
-        msg = f"Blogger blog lookup failed {r.status_code}: {r.text[:300]}"
-        fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
-    b = r.json()
-    note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
-
-
-# ---------------- feeds ----------------
-def feed_image(e):
-    for k in ("media_content", "media_thumbnail"):
-        arr = [m for m in (e.get(k) or []) if m.get("url")]
-        if arr:
-            return max(arr, key=lambda m: int(m.get("width") or 0))["url"]
-    for l in e.get("links", []):
-        if l.get("rel") == "enclosure" and "image" in (l.get("type") or ""):
-            return l.get("href")
-    m = re.search(r'<img[^>]+src=["\']([^"\']+)', e.get("summary", "") or e.get("description", "") or "")
-    return m.group(1) if m else None
-
-
-def upgrade_img(u):
-    if not u:
-        return None
-    u = re.sub(r"/standard/\d+/", "/standard/976/", u)
-    u = re.sub(r"/news/\d+/", "/news/976/", u)
-    return u if u.startswith("http") else None
-
-
-def fetch_feed(url):
-    try:
-        r = S.get(url, timeout=12)
-        r.raise_for_status()
-        fp = feedparser.parse(r.content)
-    except Exception as ex:
-        log("feed failed:", url, ex)
-        return []
-    src = clean(fp.feed.get("title") or "") or urlparse(url).netloc
-    out = []
-    for e in fp.entries[:30]:
-        link, title = e.get("link"), clean(e.get("title"))
-        if not link or not title:
-            continue
-        ts = calendar.timegm(e.published_parsed) if e.get("published_parsed") else 0
-        raw_img = feed_image(e)
-        out.append({
-            "id": hashlib.md5(link.encode()).hexdigest(),
-            "title": title, "link": link, "source": src, "ts": ts,
-            "summary": clean(e.get("summary") or e.get("description") or ""),
-            "image": upgrade_img(raw_img),
-            "image_raw": raw_img if raw_img and raw_img.startswith("http") else None,
-        })
-    return out
-
-
-def fetch_trends():
-    """Google Trends 'trending now' terms. Optional: silently ignored if unavailable."""
-    try:
-        r = S.get("https://trends.google.com/trending/rss?geo=US", timeout=12)
-        fp = feedparser.parse(r.content)
-        return [t for t in (toks(clean(e.get("title"))) for e in fp.entries[:40] if e.get("title")) if t]
-    except Exception:
-        return []
-
-# ---------------- Blogger ----------------
-def access_token():
-    r = S.post("https://oauth2.googleapis.com/token", data={
-        "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
-        "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
-    }, timeout=30)
-    if r.status_code != 200:
-        raise PostError(f"token error {r.status_code}: {r.text[:300]}")
-    return r.json()["access_token"]
-
-
-def hint_for(text):
-    t = text.lower()
-    if "invalid_grant" in t:
-        return ("Refresh token is expired or revoked. If your OAuth consent screen is in 'Testing' mode, refresh tokens "
-                "expire after 7 days: set the app to 'In production' and create a new refresh token.")
-    if "invalid_client" in t:
-        return "CLIENT_ID or CLIENT_SECRET is wrong (or not from the same OAuth client that created the refresh token)."
-    if "accessnotconfigured" in t or "has not been used" in t or "disabled" in t:
-        return "Blogger API v3 is not enabled. Google Cloud Console -> APIs & Services -> Library -> enable 'Blogger API v3'."
-    if "insufficient" in t or "scope" in t:
-        return "The refresh token was created without the scope https://www.googleapis.com/auth/blogger. Create a new token with that scope."
-    if "404" in t or "notfound" in t:
-        return "BLOG_ID is wrong, or this Google account has no access to that blog."
-    return "Check the secrets CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN and BLOG_ID."
-
-
-def blogger_post(title, content, label):
-    r = S.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts/",
-        headers={"Authorization": f"Bearer {access_token()}"},
-        json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
-        timeout=60,
-    )
+def write_test(tok):
+    """Create a throw-away draft and delete it, to prove the token can write to this blog."""
+    base = f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts"
+    h = {"Authorization": f"Bearer {tok}"}
+    r = S.post(base + "/?isDraft=true", headers=h,
+               json={"kind": "blogger#post", "title": "Connection test (auto-deleted)", "content": "test"}, timeout=30)
     if r.status_code >= 300:
-        raise PostError(f"blogger error {r.status_code}: {r.text[:400]}")
-    return r.json().get("url")
+        msg = f"Blogger write test failed {r.status_code}: {r.text[:300]}"
+        fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
+    pid = r.json().get("id")
+    if pid:
+        try:
+            S.delete(f"{base}/{pid}", headers=h, timeout=30)
+        except Exception:
+            pass
+    note("Blogger WRITE permission OK")
 
 
-def preflight():
+def preflight(st):
     # 1) local AI
     try:
         r = S.get(f"{OLLAMA}/api/tags", timeout=10)
@@ -352,11 +259,16 @@ def preflight():
         raise
     except Exception as ex:
         fatal(f"Local AI (Ollama) is not reachable: {ex}")
-    # 2) Blogger credentials + blog id
+    # 2) Blogger credentials, scope, blog id, write permission
     try:
-        tok = access_token()
+        info = token_info()
     except PostError as ex:
         fatal(f"{ex} | HOW TO FIX: {hint_for(str(ex))}")
+    tok = info["access_token"]
+    scopes = info.get("scope", "").split()
+    if scopes and BLOGGER_SCOPE not in scopes:
+        fatal(f"Refresh token scopes are {scopes}, but writing posts needs {BLOGGER_SCOPE}. "
+              "HOW TO FIX: create a new refresh token with that scope (not .readonly) and update the REFRESH_TOKEN secret.")
     r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}",
               headers={"Authorization": f"Bearer {tok}"}, timeout=30)
     if r.status_code != 200:
@@ -364,6 +276,9 @@ def preflight():
         fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
     b = r.json()
     note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
+    if not st.get("write_ok"):
+        write_test(tok)
+        st["write_ok"] = True
 
 
 # ---------------- feeds ----------------
@@ -506,13 +421,13 @@ def pick_images(members, cl, pimgs):
     with ThreadPoolExecutor(max_workers=8) as ex:
         ok = list(ex.map(lambda x: img_ok(x[0]), cands))
     good = [c for c, g in zip(cands, ok) if g]
-    out, srcs_seen = [], set()
+    out, keys = [], set()
     for u, s in good:
-        # avoid using two variants of the same picture
+        # avoid using two size-variants of the same picture
         key = re.sub(r"/standard/\d+/|/news/\d+/", "/", u)
-        if key in srcs_seen:
+        if key in keys:
             continue
-        srcs_seen.add(key)
+        keys.add(key)
         out.append((u, s))
     return out[:2]
 
@@ -554,7 +469,7 @@ RULES:
 - Attribute claims naturally using only these outlet names: {outlets}. Do not add any number, date, quote or name that is not in the sources.
 - Banned phrases: "in conclusion", "delve", "in today's fast-paced world", "landscape", "tapestry", "it is important to note".
 - Headline: under 65 characters, specific, main keyword near the start, no clickbait.
-- Use only simple HTML: <p>, <h2>, <h3>, <ul>, <li>, <strong>. No <h1>, no images, no scripts, no markdown.
+- Write the post body in simple HTML tags only: <p>, <h2>, <h3>, <ul>, <li>, <strong>. No <h1>, no images, no scripts, no markdown.
 - {ad_txt}
 
 OUTPUT FORMAT (exactly):
@@ -583,6 +498,40 @@ def llm(system, user):
     return ""
 
 
+def md_to_html(t):
+    """Fallback: the small model sometimes answers in markdown instead of HTML."""
+    out, in_ul = [], False
+    for line in t.splitlines():
+        s = line.strip()
+        if not s:
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            continue
+        m = re.match(r"^(#{1,4})\s+(.*)", s)
+        if m:
+            if in_ul:
+                out.append("</ul>")
+                in_ul = False
+            lvl = 2 if len(m.group(1)) <= 2 else 3
+            out.append(f"<h{lvl}>{m.group(2)}</h{lvl}>")
+            continue
+        m = re.match(r"^[-*\u2022]\s+(.*)", s)
+        if m:
+            if not in_ul:
+                out.append("<ul>")
+                in_ul = True
+            out.append(f"<li>{m.group(1)}</li>")
+            continue
+        if in_ul:
+            out.append("</ul>")
+            in_ul = False
+        out.append(s if s.startswith("<") or s.startswith("[[AD:") else f"<p>{s}</p>")
+    if in_ul:
+        out.append("</ul>")
+    return "\n".join(out)
+
+
 def parse_output(raw, fallback_title):
     raw = re.sub(r"```(?:html)?", "", raw).strip()
     head = raw[:700]
@@ -594,8 +543,11 @@ def parse_output(raw, fallback_title):
     elif t:
         start = t.end()
     body = re.sub(r"^\s*-{3,}\s*", "", raw[start:]).strip()
-    if "<" not in body:
+    if len(body) < 200:
         return None
+    if not re.search(r"<(p|h2|h3|ul)\b", body):
+        body = md_to_html(body)
+    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
     title = re.sub(r"[*#\"]", "", t.group(1)).strip()[:100] if t else ""
     if len(title) < 8:
         title = fallback_title[:100]
@@ -757,7 +709,7 @@ def build_post(cat, cl, st):
     log(f"AI finished in {time.time() - t0:.0f}s, {len(raw.split())} words")
     parsed = parse_output(raw, lead)
     if not parsed:
-        note(f"[{cat}] SKIPPED (AI output had no usable HTML): {lead}")
+        note(f"[{cat}] SKIPPED (AI output unusable): {lead}")
         return None
     title, desc, body = parsed
 
@@ -805,6 +757,7 @@ def process(cat, st, trends):
             continue
         url = blogger_post(res[0], res[1], cat)
         st["seen"].extend(ids)
+        st["write_ok"] = True
         record_topic(st, cat, titles[:6], res[0])
         note(f"POSTED [{cat}]: {res[0]} -> {url}")
         return True
@@ -813,8 +766,8 @@ def process(cat, st, trends):
 
 def main():
     start = time.time()
-    preflight()
     st = load_state()
+    preflight(st)
     cats = list(CATEGORIES)
     trends = fetch_trends()
     log("trending terms loaded:", len(trends))
@@ -829,6 +782,7 @@ def main():
             posted = process(cat, st, trends)
         except PostError as ex:
             note(f"BLOGGER ERROR while posting: {ex} | HOW TO FIX: {hint_for(str(ex))}")
+            st["write_ok"] = False
             blogger_failed = True
             break
         except Exception as ex:
