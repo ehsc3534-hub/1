@@ -1,4 +1,4 @@
-import calendar, hashlib, json, os, re, time
+import calendar, hashlib, json, os, re, sys, time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -17,6 +17,7 @@ MAX_FAILS = 5
 TIME_BUDGET = 40 * 60
 TOPIC_WINDOW = 30 * 86400  # a topic is blocked from repeating for 30 days
 ITEM_AGE = 72 * 3600
+MIN_WORDS = 200
 
 S = requests.Session()
 S.headers.update({"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"})
@@ -83,6 +84,8 @@ STOP = set("""the and for with from that this will have has had are was were bee
 more than what when where who how why its his her their our out you your not but can could would should may might also
 just amid during under against between via off one two get gets set per vs may year years day days""".split())
 
+REPORT = []
+
 
 class PostError(Exception):
     pass
@@ -90,6 +93,35 @@ class PostError(Exception):
 
 def log(*a):
     print(*a, flush=True)
+
+
+def note(msg):
+    REPORT.append(msg)
+    log(msg)
+
+
+def write_summary():
+    p = os.getenv("GITHUB_STEP_SUMMARY")
+    if p:
+        try:
+            with open(p, "a") as f:
+                f.write("## News bot report\n" + "\n".join(f"- {r}" for r in REPORT) + "\n")
+        except Exception:
+            pass
+
+
+def write_output(nxt):
+    out = os.getenv("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"next={'true' if nxt else 'false'}\n")
+
+
+def fatal(msg):
+    note("FATAL: " + msg)
+    write_summary()
+    write_output(False)
+    sys.exit(1)
 
 
 # ---------------- state ----------------
@@ -148,6 +180,71 @@ def record_topic(st, cat, member_titles, gen_title):
     st["topics"].append({"t": time.time(), "cat": cat, "refs": refs})
 
 
+# ---------------- Blogger ----------------
+def access_token():
+    r = S.post("https://oauth2.googleapis.com/token", data={
+        "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
+        "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
+    }, timeout=30)
+    if r.status_code != 200:
+        raise PostError(f"token error {r.status_code}: {r.text[:300]}")
+    return r.json()["access_token"]
+
+
+def hint_for(text):
+    t = text.lower()
+    if "invalid_grant" in t:
+        return ("Refresh token is expired or revoked. If your OAuth consent screen is in 'Testing' mode, refresh tokens "
+                "expire after 7 days: set the app to 'In production' and create a new refresh token.")
+    if "invalid_client" in t:
+        return "CLIENT_ID or CLIENT_SECRET is wrong (or not from the same OAuth client that created the refresh token)."
+    if "accessnotconfigured" in t or "has not been used" in t or "disabled" in t:
+        return "Blogger API v3 is not enabled. Google Cloud Console -> APIs & Services -> Library -> enable 'Blogger API v3'."
+    if "insufficient" in t or "scope" in t:
+        return "The refresh token was created without the scope https://www.googleapis.com/auth/blogger. Create a new token with that scope."
+    if "404" in t or "notfound" in t:
+        return "BLOG_ID is wrong, or this Google account has no access to that blog."
+    return "Check the secrets CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN and BLOG_ID."
+
+
+def blogger_post(title, content, label):
+    r = S.post(
+        f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts/",
+        headers={"Authorization": f"Bearer {access_token()}"},
+        json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
+        timeout=60,
+    )
+    if r.status_code >= 300:
+        raise PostError(f"blogger error {r.status_code}: {r.text[:400]}")
+    return r.json().get("url")
+
+
+def preflight():
+    # 1) local AI
+    try:
+        r = S.get(f"{OLLAMA}/api/tags", timeout=10)
+        names = [m.get("name", "") for m in r.json().get("models", [])]
+        if not any(MODEL.split(":")[0] in n for n in names):
+            fatal(f"AI model '{MODEL}' is not installed in Ollama. Installed: {names}")
+        log("Ollama OK:", names)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        fatal(f"Local AI (Ollama) is not reachable: {ex}")
+    # 2) Blogger credentials + blog id
+    try:
+        tok = access_token()
+    except PostError as ex:
+        fatal(f"{ex} | HOW TO FIX: {hint_for(str(ex))}")
+    r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}",
+              headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+    if r.status_code != 200:
+        msg = f"Blogger blog lookup failed {r.status_code}: {r.text[:300]}"
+        fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
+    b = r.json()
+    note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
+
+
 # ---------------- feeds ----------------
 def feed_image(e):
     for k in ("media_content", "media_thumbnail"):
@@ -184,11 +281,134 @@ def fetch_feed(url):
         if not link or not title:
             continue
         ts = calendar.timegm(e.published_parsed) if e.get("published_parsed") else 0
+        raw_img = feed_image(e)
         out.append({
             "id": hashlib.md5(link.encode()).hexdigest(),
             "title": title, "link": link, "source": src, "ts": ts,
             "summary": clean(e.get("summary") or e.get("description") or ""),
-            "image": upgrade_img(feed_image(e)),
+            "image": upgrade_img(raw_img),
+            "image_raw": raw_img if raw_img and raw_img.startswith("http") else None,
+        })
+    return out
+
+
+def fetch_trends():
+    """Google Trends 'trending now' terms. Optional: silently ignored if unavailable."""
+    try:
+        r = S.get("https://trends.google.com/trending/rss?geo=US", timeout=12)
+        fp = feedparser.parse(r.content)
+        return [t for t in (toks(clean(e.get("title"))) for e in fp.entries[:40] if e.get("title")) if t]
+    except Exception:
+        return []
+
+# ---------------- Blogger ----------------
+def access_token():
+    r = S.post("https://oauth2.googleapis.com/token", data={
+        "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
+        "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
+    }, timeout=30)
+    if r.status_code != 200:
+        raise PostError(f"token error {r.status_code}: {r.text[:300]}")
+    return r.json()["access_token"]
+
+
+def hint_for(text):
+    t = text.lower()
+    if "invalid_grant" in t:
+        return ("Refresh token is expired or revoked. If your OAuth consent screen is in 'Testing' mode, refresh tokens "
+                "expire after 7 days: set the app to 'In production' and create a new refresh token.")
+    if "invalid_client" in t:
+        return "CLIENT_ID or CLIENT_SECRET is wrong (or not from the same OAuth client that created the refresh token)."
+    if "accessnotconfigured" in t or "has not been used" in t or "disabled" in t:
+        return "Blogger API v3 is not enabled. Google Cloud Console -> APIs & Services -> Library -> enable 'Blogger API v3'."
+    if "insufficient" in t or "scope" in t:
+        return "The refresh token was created without the scope https://www.googleapis.com/auth/blogger. Create a new token with that scope."
+    if "404" in t or "notfound" in t:
+        return "BLOG_ID is wrong, or this Google account has no access to that blog."
+    return "Check the secrets CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN and BLOG_ID."
+
+
+def blogger_post(title, content, label):
+    r = S.post(
+        f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts/",
+        headers={"Authorization": f"Bearer {access_token()}"},
+        json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
+        timeout=60,
+    )
+    if r.status_code >= 300:
+        raise PostError(f"blogger error {r.status_code}: {r.text[:400]}")
+    return r.json().get("url")
+
+
+def preflight():
+    # 1) local AI
+    try:
+        r = S.get(f"{OLLAMA}/api/tags", timeout=10)
+        names = [m.get("name", "") for m in r.json().get("models", [])]
+        if not any(MODEL.split(":")[0] in n for n in names):
+            fatal(f"AI model '{MODEL}' is not installed in Ollama. Installed: {names}")
+        log("Ollama OK:", names)
+    except SystemExit:
+        raise
+    except Exception as ex:
+        fatal(f"Local AI (Ollama) is not reachable: {ex}")
+    # 2) Blogger credentials + blog id
+    try:
+        tok = access_token()
+    except PostError as ex:
+        fatal(f"{ex} | HOW TO FIX: {hint_for(str(ex))}")
+    r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}",
+              headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+    if r.status_code != 200:
+        msg = f"Blogger blog lookup failed {r.status_code}: {r.text[:300]}"
+        fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
+    b = r.json()
+    note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
+
+
+# ---------------- feeds ----------------
+def feed_image(e):
+    for k in ("media_content", "media_thumbnail"):
+        arr = [m for m in (e.get(k) or []) if m.get("url")]
+        if arr:
+            return max(arr, key=lambda m: int(m.get("width") or 0))["url"]
+    for l in e.get("links", []):
+        if l.get("rel") == "enclosure" and "image" in (l.get("type") or ""):
+            return l.get("href")
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)', e.get("summary", "") or e.get("description", "") or "")
+    return m.group(1) if m else None
+
+
+def upgrade_img(u):
+    if not u:
+        return None
+    u = re.sub(r"/standard/\d+/", "/standard/976/", u)
+    u = re.sub(r"/news/\d+/", "/news/976/", u)
+    return u if u.startswith("http") else None
+
+
+def fetch_feed(url):
+    try:
+        r = S.get(url, timeout=12)
+        r.raise_for_status()
+        fp = feedparser.parse(r.content)
+    except Exception as ex:
+        log("feed failed:", url, ex)
+        return []
+    src = clean(fp.feed.get("title") or "") or urlparse(url).netloc
+    out = []
+    for e in fp.entries[:30]:
+        link, title = e.get("link"), clean(e.get("title"))
+        if not link or not title:
+            continue
+        ts = calendar.timegm(e.published_parsed) if e.get("published_parsed") else 0
+        raw_img = feed_image(e)
+        out.append({
+            "id": hashlib.md5(link.encode()).hexdigest(),
+            "title": title, "link": link, "source": src, "ts": ts,
+            "summary": clean(e.get("summary") or e.get("description") or ""),
+            "image": upgrade_img(raw_img),
+            "image_raw": raw_img if raw_img and raw_img.startswith("http") else None,
         })
     return out
 
@@ -259,7 +479,8 @@ def fetch_page(url):
 def img_ok(u):
     try:
         r = S.get(u, stream=True, timeout=8)
-        ok = r.status_code == 200 and r.headers.get("content-type", "").startswith("image")
+        ct = r.headers.get("content-type", "").lower()
+        ok = r.status_code == 200 and (ct.startswith("image") or re.search(r"\.(jpe?g|png|webp)(\?|$)", u.lower()) is not None)
         cl = r.headers.get("content-length")
         if ok and cl and int(cl) < 5000:
             ok = False
@@ -270,17 +491,30 @@ def img_ok(u):
 
 
 def pick_images(members, cl, pimgs):
+    ordered = []
+    for m in members:
+        ordered += [(m["image"], m["source"]), (m.get("image_raw"), m["source"])]
+    ordered += [(p, m["source"]) for m, p in zip(members, pimgs)]
+    for m in cl:
+        ordered += [(m["image"], m["source"]), (m.get("image_raw"), m["source"])]
     cands, seen = [], set()
-    ordered = [(m["image"], m["source"]) for m in members] + [(p, m["source"]) for m, p in zip(members, pimgs)] \
-        + [(m["image"], m["source"]) for m in cl]
     for u, s in ordered:
         if u and u not in seen:
             seen.add(u)
             cands.append((u, s))
-    cands = cands[:8]
+    cands = cands[:10]
     with ThreadPoolExecutor(max_workers=8) as ex:
         ok = list(ex.map(lambda x: img_ok(x[0]), cands))
-    return [c for c, good in zip(cands, ok) if good][:2]
+    good = [c for c, g in zip(cands, ok) if g]
+    out, srcs_seen = [], set()
+    for u, s in good:
+        # avoid using two variants of the same picture
+        key = re.sub(r"/standard/\d+/|/news/\d+/", "/", u)
+        if key in srcs_seen:
+            continue
+        srcs_seen.add(key)
+        out.append((u, s))
+    return out[:2]
 
 
 # ---------------- AI ----------------
@@ -315,7 +549,7 @@ STRUCTURE (blend all six parts into one flowing post):
 6. OUTRO: first <h2>What People Are Asking</h2> with 2 or 3 short <h3> questions readers would search, each followed by a <p> answer from the facts. Then a final <h2> (for example "The Bottom Line") with a brief summary and a closing open-ended question that invites readers to comment.
 
 RULES:
-- 800 to 1000 words. Rewrite everything in fresh words; never copy sentences.
+- 700 to 900 words. Rewrite everything in fresh words; never copy sentences.
 - Headings must be natural and specific to the story. Never use labels like "The Hook".
 - Attribute claims naturally using only these outlet names: {outlets}. Do not add any number, date, quote or name that is not in the sources.
 - Banned phrases: "in conclusion", "delve", "in today's fast-paced world", "landscape", "tapestry", "it is important to note".
@@ -331,30 +565,43 @@ DESCRIPTION: <meta description, max 150 characters>
 
 
 def llm(system, user):
-    for _ in range(2):
+    for attempt in range(2):
         try:
             r = requests.post(f"{OLLAMA}/api/chat", json={
                 "model": MODEL, "stream": False, "keep_alive": "30m",
-                "options": {"temperature": 0.65, "top_p": 0.9, "num_ctx": 8192, "num_predict": 2600},
+                "options": {"temperature": 0.65, "top_p": 0.9, "num_ctx": 8192, "num_predict": 2400},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            }, timeout=1700)
+            }, timeout=1200)
             r.raise_for_status()
             return r.json()["message"]["content"]
+        except requests.exceptions.ReadTimeout:
+            note("AI took too long (timeout). Use a smaller model or fewer tokens.")
+            return ""
         except Exception as ex:
             log("llm error:", ex)
             time.sleep(3)
     return ""
 
 
-def parse_output(raw):
-    raw = re.sub(r"```(?:html)?", "", raw)
-    t = re.search(r"TITLE:\s*(.+)", raw)
-    d = re.search(r"DESCRIPTION:\s*(.+)", raw)
-    if not t or not d:
+def parse_output(raw, fallback_title):
+    raw = re.sub(r"```(?:html)?", "", raw).strip()
+    head = raw[:700]
+    t = re.search(r"title\s*:\s*\**\s*(.+)", head, re.I)
+    d = re.search(r"description\s*:\s*\**\s*(.+)", head, re.I)
+    start = 0
+    if d and (not t or d.start() > t.start()):
+        start = d.end()
+    elif t:
+        start = t.end()
+    body = re.sub(r"^\s*-{3,}\s*", "", raw[start:]).strip()
+    if "<" not in body:
         return None
-    body = re.sub(r"^\s*-{3,}\s*", "", raw[d.end():])
-    title = re.sub(r"[*#\"]", "", t.group(1)).strip()[:100]
-    desc = re.sub(r"[*#]", "", d.group(1)).strip()[:155]
+    title = re.sub(r"[*#\"]", "", t.group(1)).strip()[:100] if t else ""
+    if len(title) < 8:
+        title = fallback_title[:100]
+    desc = re.sub(r"[*#]", "", d.group(1)).strip()[:155] if d else ""
+    if len(desc) < 20:
+        desc = clean(body)[:150]
     return title, desc, body
 
 
@@ -471,31 +718,9 @@ def assemble(title, desc, inner, imgs, members):
             f'<p style="font-size:13px;color:#555"><em>Sources: {links}</em></p>{ld_html}</div>')
 
 
-# ---------------- Blogger ----------------
-def access_token():
-    r = S.post("https://oauth2.googleapis.com/token", data={
-        "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
-        "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
-    }, timeout=30)
-    if r.status_code != 200:
-        raise PostError(f"token error {r.status_code}: {r.text[:200]}")
-    return r.json()["access_token"]
-
-
-def blogger_post(title, content, label):
-    r = S.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts/",
-        headers={"Authorization": f"Bearer {access_token()}"},
-        json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
-        timeout=60,
-    )
-    if r.status_code >= 300:
-        raise PostError(f"blogger error {r.status_code}: {r.text[:300]}")
-    return r.json().get("url")
-
-
 # ---------------- pipeline ----------------
 def build_post(cat, cl, st):
+    lead = cl[0]["title"]
     # pick up to MAX_SOURCES different outlets, newest first
     members, used = [], set()
     for m in sorted(cl, key=lambda m: m["ts"], reverse=True):
@@ -512,7 +737,7 @@ def build_post(cat, cl, st):
     # an image is mandatory: check this first so no AI time is wasted
     imgs = pick_images(members, cl, [p[1] for p in pages])
     if not imgs:
-        log("no valid image found, skipping topic")
+        note(f"[{cat}] SKIPPED (no working image found): {lead}")
         return None
 
     blocks, total = [], 0
@@ -521,26 +746,30 @@ def build_post(cat, cl, st):
         total += len(facts)
         blocks.append(f"SOURCE {n} - {m['source']}\nHeadline: {m['title']}\nSummary: {m['summary'][:400]}\nDetails: {facts}")
     if total < 350:
-        log("too little source text, skipping topic")
+        note(f"[{cat}] SKIPPED (too little source text, {total} chars): {lead}")
         return None
 
     src = " ".join([m["title"] + " " + m["summary"] for m in cl] + [p[0] for p in pages])
     outlets = ", ".join(m["source"] for m in members)
     ads = ads_available()
-    parsed = parse_output(llm(SYSTEM, make_prompt(cat, "\n\n".join(blocks), outlets, ads)))
+    t0 = time.time()
+    raw = llm(SYSTEM, make_prompt(cat, "\n\n".join(blocks), outlets, ads))
+    log(f"AI finished in {time.time() - t0:.0f}s, {len(raw.split())} words")
+    parsed = parse_output(raw, lead)
     if not parsed:
-        log("bad AI output")
+        note(f"[{cat}] SKIPPED (AI output had no usable HTML): {lead}")
         return None
     title, desc, body = parsed
 
     if is_dup([toks(title)], st):
-        log("generated title duplicates an earlier post, skipping:", title)
+        note(f"[{cat}] SKIPPED (generated title duplicates an earlier post): {title}")
         return None
 
     soup = sanitize(body)
     fact_check(soup, src)
-    if len(soup.get_text().split()) < 300:
-        log("article too short after checks")
+    words = len(soup.get_text().split())
+    if words < MIN_WORDS:
+        note(f"[{cat}] SKIPPED (article only {words} words after checks): {lead}")
         return None
     inner = soup.body.decode_contents() if soup.body else str(soup)
     inner = place_ads(inner, ads)
@@ -551,6 +780,7 @@ def process(cat, st, trends):
     seen = set(st["seen"])
     items = [i for i in collect(cat) if i["id"] not in seen]
     if not items:
+        note(f"[{cat}] no fresh items in feeds")
         return False
     ranked = []
     for c in cluster(items):
@@ -576,40 +806,44 @@ def process(cat, st, trends):
         url = blogger_post(res[0], res[1], cat)
         st["seen"].extend(ids)
         record_topic(st, cat, titles[:6], res[0])
-        log("POSTED:", url)
+        note(f"POSTED [{cat}]: {res[0]} -> {url}")
         return True
     return False
 
 
 def main():
     start = time.time()
+    preflight()
     st = load_state()
     cats = list(CATEGORIES)
     trends = fetch_trends()
     log("trending terms loaded:", len(trends))
     posted = False
+    blogger_failed = False
     for _ in range(len(cats)):
         if time.time() - start > TIME_BUDGET:
+            note("Time budget reached, stopping this run")
             break
         cat = cats[st["idx"] % len(cats)]
         try:
             posted = process(cat, st, trends)
         except PostError as ex:
-            log("BLOGGER ERROR:", ex)
+            note(f"BLOGGER ERROR while posting: {ex} | HOW TO FIX: {hint_for(str(ex))}")
+            blogger_failed = True
             break
         except Exception as ex:
-            log("ERROR:", cat, repr(ex))
+            note(f"ERROR in {cat}: {ex!r}")
         st["idx"] = (st["idx"] + 1) % len(cats)
         if posted:
             break
     st["fails"] = 0 if posted else st["fails"] + 1
     save_state(st)
-    nxt = st["fails"] < MAX_FAILS
+    nxt = (not blogger_failed) and st["fails"] < MAX_FAILS
+    write_summary()
+    write_output(nxt)
     log("next run:", nxt)
-    out = os.getenv("GITHUB_OUTPUT")
-    if out:
-        with open(out, "a") as f:
-            f.write(f"next={'true' if nxt else 'false'}\n")
+    if blogger_failed or st["fails"] >= MAX_FAILS:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
