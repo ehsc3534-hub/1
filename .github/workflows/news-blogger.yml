@@ -1,0 +1,95 @@
+name: News to Blogger (auto chain)
+run-name: News to Blogger (chain=${{ github.event.inputs.chain || 'true' }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      chain:
+        description: "Keep posting automatically after each post? (false = only one post)"
+        type: choice
+        default: "true"
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: news-blogger
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      OLLAMA_MODEL: qwen2.5:3b
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          BLOG_ID: ${{ secrets.BLOG_ID }}
+        run: |
+          for v in CLIENT_ID CLIENT_SECRET REFRESH_TOKEN BLOG_ID; do
+            if [ -z "${!v}" ]; then echo "::error::Missing secret: $v"; exit 1; fi
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Cache AI model
+        uses: actions/cache@v4
+        with:
+          path: ~/ollama-models
+          key: ollama-${{ env.OLLAMA_MODEL }}
+
+      - name: Start local AI (Ollama)
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          sudo systemctl stop ollama || true
+          mkdir -p ~/ollama-models
+          OLLAMA_MODELS=$HOME/ollama-models OLLAMA_NUM_PARALLEL=1 nohup ollama serve > ollama.log 2>&1 &
+          for i in $(seq 1 40); do curl -s localhost:11434/api/tags >/dev/null && break; sleep 1; done
+          ollama pull "$OLLAMA_MODEL"
+
+      - name: Create one post
+        id: run
+        run: python main.py
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          BLOG_ID: ${{ secrets.BLOG_ID }}
+          SITE_NAME: ${{ secrets.SITE_NAME }}
+          BANNER_468X60: ${{ secrets.BANNER_468X60 }}
+          BANNER_300X250: ${{ secrets.BANNER_300X250 }}
+          BANNER_320X50: ${{ secrets.BANNER_320X50 }}
+          NATIVE_BANNER: ${{ secrets.NATIVE_BANNER }}
+          AD_NATIVE: ${{ secrets.AD_NATIVE }}
+          AD_BANNER: ${{ secrets.AD_BANNER }}
+          AD_MULTITAG: ${{ secrets.AD_MULTITAG }}
+          ADSENSE_ID: ${{ secrets.ADSENSE_ID }}
+
+      - name: Save state
+        if: always()
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "state update" && git pull --rebase -q && git push)
+
+      - name: Trigger next run immediately
+        if: steps.run.outputs.next == 'true' && github.event.inputs.chain != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run news-blogger.yml --ref ${{ github.ref_name }} -f chain=true
