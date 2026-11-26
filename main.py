@@ -127,6 +127,10 @@ def fatal(msg):
     sys.exit(1)
 
 
+def blog_id():
+    return os.environ["BLOG_ID"].strip()
+
+
 # ---------------- state ----------------
 def load_state():
     try:
@@ -187,8 +191,8 @@ def record_topic(st, cat, member_titles, gen_title):
 # ---------------- Blogger ----------------
 def token_info():
     r = S.post("https://oauth2.googleapis.com/token", data={
-        "client_id": os.environ["CLIENT_ID"], "client_secret": os.environ["CLIENT_SECRET"],
-        "refresh_token": os.environ["REFRESH_TOKEN"], "grant_type": "refresh_token",
+        "client_id": os.environ["CLIENT_ID"].strip(), "client_secret": os.environ["CLIENT_SECRET"].strip(),
+        "refresh_token": os.environ["REFRESH_TOKEN"].strip(), "grant_type": "refresh_token",
     }, timeout=30)
     if r.status_code != 200:
         raise PostError(f"token error {r.status_code}: {r.text[:300]}")
@@ -207,9 +211,9 @@ def hint_for(text):
     if "invalid_client" in t:
         return "CLIENT_ID or CLIENT_SECRET is wrong (or not from the same OAuth client that created the refresh token)."
     if "permission" in t or "forbidden" in t or "insufficient" in t or "scope" in t:
-        return ("The token can read the blog but cannot write. Create a NEW refresh token with the scope "
-                f"{BLOGGER_SCOPE} (not .readonly), using the Google account that owns or is an Author/Admin of this blog, "
-                "then update the REFRESH_TOKEN secret.")
+        return ("The token can read the blog but cannot write. Most likely the Google account that created the refresh token is "
+                "not an Admin/Author of this blog. Create the refresh token while signed in to the Google account that owns the blog "
+                f"(scope {BLOGGER_SCOPE}), or invite that account as Admin in Blogger -> Settings -> Permissions, then update REFRESH_TOKEN.")
     if "accessnotconfigured" in t or "has not been used" in t or "disabled" in t:
         return "Blogger API v3 is not enabled. Google Cloud Console -> APIs & Services -> Library -> enable 'Blogger API v3'."
     if "404" in t or "notfound" in t:
@@ -219,7 +223,7 @@ def hint_for(text):
 
 def blogger_post(title, content, label):
     r = S.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts/",
+        f"https://www.googleapis.com/blogger/v3/blogs/{blog_id()}/posts/",
         headers={"Authorization": f"Bearer {access_token()}"},
         json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
         timeout=60,
@@ -231,7 +235,7 @@ def blogger_post(title, content, label):
 
 def write_test(tok):
     """Create a throw-away draft and delete it, to prove the token can write to this blog."""
-    base = f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}/posts"
+    base = f"https://www.googleapis.com/blogger/v3/blogs/{blog_id()}/posts"
     h = {"Authorization": f"Bearer {tok}"}
     r = S.post(base + "/?isDraft=true", headers=h,
                json={"kind": "blogger#post", "title": "Connection test (auto-deleted)", "content": "test"}, timeout=30)
@@ -259,23 +263,47 @@ def preflight(st):
         raise
     except Exception as ex:
         fatal(f"Local AI (Ollama) is not reachable: {ex}")
-    # 2) Blogger credentials, scope, blog id, write permission
+    # 2) Blogger credentials, scope, blog id, account access, write permission
     try:
         info = token_info()
     except PostError as ex:
         fatal(f"{ex} | HOW TO FIX: {hint_for(str(ex))}")
     tok = info["access_token"]
+    h = {"Authorization": f"Bearer {tok}"}
     scopes = info.get("scope", "").split()
+    note(f"Token scopes: {scopes if scopes else 'not reported by Google'}")
     if scopes and BLOGGER_SCOPE not in scopes:
         fatal(f"Refresh token scopes are {scopes}, but writing posts needs {BLOGGER_SCOPE}. "
               "HOW TO FIX: create a new refresh token with that scope (not .readonly) and update the REFRESH_TOKEN secret.")
-    r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{os.environ['BLOG_ID']}",
-              headers={"Authorization": f"Bearer {tok}"}, timeout=30)
+    r = S.get(f"https://www.googleapis.com/blogger/v3/blogs/{blog_id()}", headers=h, timeout=30)
     if r.status_code != 200:
         msg = f"Blogger blog lookup failed {r.status_code}: {r.text[:300]}"
         fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
     b = r.json()
     note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
+
+    # which blogs can THIS Google account actually write to?
+    try:
+        ub = S.get("https://www.googleapis.com/blogger/v3/users/self/blogs",
+                   params=[("role", "ADMIN"), ("role", "AUTHOR")], headers=h, timeout=30)
+        if ub.status_code == 200:
+            items = ub.json().get("items", [])
+            ids = [str(i.get("id")) for i in items]
+            listing = ", ".join(f"{i.get('name')} (id {i.get('id')})" for i in items) or "none"
+            note(f"Blogs this Google account can write to: {listing}")
+            if blog_id() not in ids:
+                fatal(f"The Google account that created your REFRESH_TOKEN is NOT an Admin/Author of blog id {blog_id()} "
+                      f"('{b.get('name')}'). It can only write to: {listing}. "
+                      "HOW TO FIX: create the refresh token again in OAuth Playground while signed in to the Google account "
+                      "that owns this blog (check blogger.com), or add the token's account as Admin in Blogger -> Settings -> "
+                      "Permissions and accept the invitation, then update the REFRESH_TOKEN secret.")
+        else:
+            note(f"Could not list this account's blogs (HTTP {ub.status_code}); continuing with write test")
+    except SystemExit:
+        raise
+    except Exception as ex:
+        note(f"Could not list this account's blogs: {ex}")
+
     if not st.get("write_ok"):
         write_test(tok)
         st["write_ok"] = True
