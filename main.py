@@ -14,7 +14,7 @@ OLLAMA = "http://127.0.0.1:11434"
 STATE_FILE = "state.json"
 SITE_NAME = os.getenv("SITE_NAME") or "Newsroom"
 MAX_CLUSTER_TRIES = 4      # topics tried per category per run
-MAX_SOURCES = 5            # outlets whose facts are given to the AI
+MAX_SOURCES = 5            # outlets whose facts are used
 MAX_FAILS = 5
 TIME_BUDGET = 45 * 60
 TOPIC_WINDOW = 30 * 86400  # a topic is blocked from repeating for 30 days
@@ -122,6 +122,18 @@ STOP = set("""the and for with from that this will have has had are was were bee
 more than what when where who how why its his her their our out you your not but can could would should may might also
 just amid during under against between via off one two get gets set per vs may year years day days""".split())
 
+HARD_BANNED = ["in conclusion", "delve", "tapestry", "it's important to note", "it is important to note",
+               "in today's fast-paced", "game-changer", "game changer", "shed light", "navigate the", "rich tapestry",
+               "in the ever-evolving", "ever-changing landscape", "stay tuned"]
+
+FORMS = {
+    "prose": "Write 2 or 3 short paragraphs (120 to 190 words in total), separated by a blank line.",
+    "list": "Write one short lead-in sentence, then 3 to 5 bullet lines. Every bullet starts with '- ' and carries one specific fact.",
+    "timeline": ("Write 3 to 6 lines, each formatted 'WHEN: what happened', in time order. Use only dates or times that appear in "
+                 "the facts. If the facts contain no dates or times, write two short paragraphs instead."),
+    "qa": "Write 2 or 3 questions a real reader would ask, each as 'Q: ...' on its own line followed by 'A: ...' (2 to 3 sentences) on the next line.",
+}
+
 REPORT = []
 
 
@@ -178,6 +190,7 @@ def load_state():
     st.setdefault("fails", 0)
     st.setdefault("topics", [])
     st.setdefault("formats", [])
+    st.setdefault("voices", [])
     st.setdefault("write_ok", False)
     return st
 
@@ -187,6 +200,7 @@ def save_state(st):
     st["topics"] = [t for t in st["topics"] if now - t["t"] < 45 * 86400][-600:]
     st["seen"] = st["seen"][-4000:]
     st["formats"] = st["formats"][-12:]
+    st["voices"] = st["voices"][-12:]
     with open(STATE_FILE, "w") as f:
         json.dump(st, f)
 
@@ -205,6 +219,9 @@ def similar(a, b, jac=0.4, ov=0.7):
     if i < 2:
         return False
     return i / len(a | b) >= jac or i / min(len(a), len(b)) >= ov
+
+
+SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z"\u201c])')
 
 
 # ---------------- duplicate-topic guard ----------------
@@ -500,7 +517,7 @@ def fetch_page(url):
     img = upgrade_img(og.get("content")) if og and og.get("content") else None
     root = soup.find("article") or soup
     ps = [clean(p.get_text(" ")) for p in root.find_all("p")]
-    return " ".join(p for p in ps if len(p) > 50)[:6000], img
+    return " ".join(p for p in ps if len(p) > 50)[:7000], img
 
 
 def img_ok(u):
@@ -538,24 +555,77 @@ def pick_image(infos, cl):
     return None
 
 
+# ---------------- fact cards (specific details pulled from all sources) ----------------
+BOILER = re.compile(r"subscribe|sign up|newsletter|cookie|click here|follow us|all rights reserved|advertisement|read more|"
+                    r"copyright|getty images|photograph:|\bwatch:|listen to|download the|privacy policy|terms of use", re.I)
+DATEW = re.compile(r"\b(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday|January|February|March|April|May|June|July|"
+                   r"August|September|October|November|December|20\d\d)\b")
+NUM = re.compile(r"\d[\d,]*\.?\d*")
+QUOTE = re.compile(r'["\u201c]([^"\u201d]{25,})["\u201d]')
+
+
+def card_score(s):
+    words = s.split()
+    nums = len(NUM.findall(s))
+    caps = sum(1 for w in words[1:] if re.match(r"^[A-Z][a-z]{2,}", w))
+    quote = 1 if QUOTE.search(s) else 0
+    datew = 1 if DATEW.search(s) else 0
+    return 2 * min(nums, 3) + 1.2 * min(caps, 6) + 2 * quote + 1.5 * datew + min(len(s), 260) / 130
+
+
+def extract_cards(infos, limit=26):
+    raw = []
+    for m, facts, _ in infos:
+        texts = [facts] + ([m["summary"]] if m["summary"] and m["summary"] not in facts else [])
+        for text in texts:
+            for s in SENT_SPLIT.split(text):
+                s = s.strip()
+                if not (45 <= len(s) <= 340) or BOILER.search(s):
+                    continue
+                raw.append({"text": s, "outlet": m["source"], "tk": toks(s), "sc": card_score(s)})
+    for c in raw:
+        outs = {d["outlet"] for d in raw if d["outlet"] != c["outlet"] and similar(c["tk"], d["tk"], 0.3, 0.5)}
+        c["co"] = len(outs)
+        c["sc"] += 3 * len(outs)
+    raw.sort(key=lambda c: c["sc"], reverse=True)
+    chosen, per = [], {}
+    for c in raw:
+        if len(chosen) >= limit:
+            break
+        if per.get(c["outlet"], 0) >= 10:
+            continue
+        if any(similar(c["tk"], d["tk"], 0.5, 0.7) for d in chosen):
+            continue
+        chosen.append(c)
+        per[c["outlet"]] = per.get(c["outlet"], 0) + 1
+    for i, c in enumerate(chosen, 1):
+        c["id"] = f"C{i}"
+    return chosen
+
+
+def card_line(c):
+    tag = c["outlet"] + (f"; also confirmed by {c['co']} other outlet{'s' if c['co'] > 1 else ''}" if c["co"] else "; single outlet")
+    return f"{c['id']} [{tag}] {c['text']}"
+
+
 # ---------------- AI ----------------
-RESEARCH_SYS = (
-    "You are a meticulous news research assistant. You extract only facts that are explicitly stated in the provided "
-    "source excerpts. You never guess and never add outside knowledge."
+PLAN_SYS = (
+    "You are the managing editor of a news explainer website. You plan posts that help curious readers truly understand "
+    "a story, and you make every post feel different from the last."
 )
 
 WRITER_SYS = (
-    "You are a staff writer at a news explainer website. You write like a smart, warm human journalist who helps readers "
-    "truly understand a story. You never invent facts, numbers, quotes or names, and you only use the material provided."
+    "You are a staff writer at a news explainer website. You write like a smart, warm human journalist: concrete, specific, "
+    "never padded. You only use the facts you are given and you never invent numbers, names, dates or quotes."
 )
 
 
-def llm(system, user, num_predict=2400, temp=0.65):
+def llm(system, user, num_predict=600, temp=0.7):
     for attempt in range(2):
         try:
             r = requests.post(f"{OLLAMA}/api/chat", json={
                 "model": MODEL, "stream": False, "keep_alive": "30m",
-                "options": {"temperature": temp, "top_p": 0.92, "repeat_penalty": 1.08, "num_ctx": 10240,
+                "options": {"temperature": temp, "top_p": 0.92, "repeat_penalty": 1.1, "num_ctx": 8192,
                             "num_predict": num_predict},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             }, timeout=1500)
@@ -570,165 +640,291 @@ def llm(system, user, num_predict=2400, temp=0.65):
     return ""
 
 
-def research_prompt(blocks):
-    return f"""Read these excerpts from several news outlets about ONE story and write a FACT SHEET for a writer.
-
-{blocks}
-
-Rules: use only facts stated in the excerpts. Put the outlet name in [brackets] after each fact. Keep exact numbers, dates, names and places. No opinions, no guesses.
-
-Output exactly these sections:
-WHAT HAPPENED: (2 to 3 lines)
-KEY FACTS: (bullets)
-BACKGROUND: (bullets)
-WHO SAYS WHAT: (bullets, only statements by named people or organisations)
-DISAGREEMENTS OR GAPS: (bullets: where outlets differ or details are missing)
-WHY IT MATTERS: (bullets, only if supported by the excerpts)"""
-
-
-def writer_prompt(cat, fact_sheet, excerpts, outlets, gn_lines, recent, ads):
-    if ads:
-        lines = "\n".join(f"  [[AD:{n}]] = {AD_HINTS[n]}" for n in ads)
-        ad_txt = (
-            "Optional ad slots. Use only the ones that genuinely fit, each at most once, never before the first "
-            "paragraph, never two in a row. Skipping all of them is fine. To place one, put its marker alone on its own line:\n" + lines
-        )
-    else:
-        ad_txt = "There are no ad slots. Do not write any [[AD:...]] markers."
-    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    return f"""Write a news EXPLAINER post for the "{cat}" section. Today is {today}. This story is trending right now.
-
-FACT SHEET (compiled from these outlets: {outlets}):
-{fact_sheet}
-
-SOURCE EXCERPTS:
-{excerpts}
-
-OTHER HEADLINES ON THIS STORY (Google News):
-{gn_lines}
-
-HOW TO WRITE IT (you decide the shape of the post):
-- Choose the best way to explain THIS story yourself. Ideas, not a checklist: a timeline, a question-led explainer, myth vs fact, both sides of the argument, a by-the-numbers breakdown, what changes for ordinary people, a cause-and-effect chain, what we know vs what we don't know yet. Invent a better one if it fits.
-- Structures recently used on this site (pick something DIFFERENT): {recent}
-- You decide how many sections there are, their order, and their headings. Headings must be specific to the story. A bullet list, short timeline or mini Q&A is allowed only where it truly helps. Do not add a FAQ or "key takeaways" unless this story needs one.
-- Write an original opening that fits the story; do not reuse a stock opening style.
-
-MUST-HAVES:
-1. SUMMARY: a short box at the very top (2 to 4 short sentences, or 3 to 4 short bullet lines) that tells the reader what the topic is, what happened and why it matters. It must stand on its own.
-2. Below it, the full explanation of 900 to 1200 words, drawing on several outlets so the reader gets the complete picture. Name the outlet when attributing ("according to ...").
-3. Explain jargon and background in plain words. If outlets disagree or details are missing, say so honestly.
-4. Use facts only from the fact sheet and excerpts. Do not invent numbers, dates, names or quotes. Do not put words in quotation marks unless they appear word-for-word in the excerpts.
-5. Human voice: vary sentence length, use contractions now and then, be concrete, skip filler. Avoid: "in conclusion", "delve", "landscape", "tapestry", "it's important to note", "in today's fast-paced world", "navigate", "game-changer", "shed light".
-6. SEO: choose one focus keyword phrase (2 to 4 words) and use it naturally in the headline, the summary, the first paragraph and at least one <h2>. Headline under 62 characters, specific, no clickbait.
-7. Body HTML uses only: <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>. No <h1>, no images, no scripts, no markdown.
-8. {ad_txt}
-
-OUTPUT FORMAT (exactly, in this order):
-TITLE: <headline>
-DESCRIPTION: <meta description, max 150 characters>
-KEYWORDS: <focus keyword>, <3 to 5 related keywords>
-FORMAT: <3 to 6 word name of the structure you chose>
-SUMMARY_HEADING: <a short natural label for the summary box, such as "In short" or "The quick version">
-SUMMARY:
-<summary text>
----
-<body html>"""
-
-
-def md_to_html(t):
-    """Fallback: the small model sometimes answers in markdown instead of HTML."""
-    out, in_ul = [], False
-    for line in t.splitlines():
-        s = line.strip()
-        if not s:
-            if in_ul:
-                out.append("</ul>")
-                in_ul = False
-            continue
-        m = re.match(r"^(#{1,4})\s+(.*)", s)
-        if m:
-            if in_ul:
-                out.append("</ul>")
-                in_ul = False
-            lvl = 2 if len(m.group(1)) <= 2 else 3
-            out.append(f"<h{lvl}>{m.group(2)}</h{lvl}>")
-            continue
-        m = re.match(r"^[-*\u2022]\s+(.*)", s)
-        if m:
-            if not in_ul:
-                out.append("<ul>")
-                in_ul = True
-            out.append(f"<li>{m.group(1)}</li>")
-            continue
-        if in_ul:
-            out.append("</ul>")
-            in_ul = False
-        out.append(s if s.startswith("<") or s.startswith("[[AD:") else f"<p>{s}</p>")
-    if in_ul:
-        out.append("</ul>")
-    return "\n".join(out)
-
-
 def hdr(name, raw):
     m = re.search(rf"^[ \t]*\**{name}\**[ \t]*:[ \t]*\**[ \t]*(.+?)[ \t]*\**[ \t]*$", raw, re.I | re.M)
     return m.group(1).strip() if m else ""
 
 
+def plan_prompt(cat, cards, outlets, gn_lines, recent_f, recent_v, ads):
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    if ads:
+        lines = "\n".join(f"  {n} = {AD_HINTS[n]}" for n in ads)
+        ad_txt = ("Ad slots are available:\n" + lines + "\nDecide yourself whether any should be used and where. Place an ad with a line "
+                  "'AD: <NAME> | <number of the section it goes after, 0 = right after the opening>'. At most one ad per position. "
+                  "Skipping ads is fine if they would hurt reading.")
+    else:
+        ad_txt = "There are no ad slots; write no AD lines."
+    card_lines = "\n".join(card_line(c) for c in cards)
+    return f"""You are planning a news EXPLAINER post for the "{cat}" section. Today is {today}. The story is trending and is covered by: {outlets}.
+
+FACT CARDS (the only facts available; ids are C1, C2, ...):
+{card_lines}
+
+OTHER HEADLINES ON THIS STORY:
+{gn_lines}
+
+Plan a post that helps a curious reader understand what is going on, why, what it means, and what is still unknown. Decide everything yourself:
+- Pick the angle that makes THIS story interesting. Do not fall back on the usual "background, analysis, outlook" pattern.
+- Structures used recently on this site (choose something different): {recent_f}
+- Narrator voices used recently (choose something different): {recent_v}
+- 3 to 5 sections. Every heading must be concrete and specific to this story (never "Background", "Analysis", "Overview", "Conclusion" or "Key Takeaways"). For each section pick the form that serves it best: prose, list, timeline (only if the cards contain dates or times) or qa. Use prose unless another form clearly helps.
+- Give every fact card to the ONE section where it fits best so nothing is repeated. Each section should get 3 to 6 cards, the opening 1 to 3. Prefer cards confirmed by several outlets and be careful with single-outlet claims.
+- {ad_txt}
+
+Reply in exactly this format and nothing else:
+ANGLE: <one sentence: the specific question or tension this post resolves>
+FOCUS: <focus keyword phrase, 2 to 4 words>
+FORMAT: <3 to 6 word name for the structure you chose>
+VOICE: <6 to 10 words describing the narrator's tone for this story>
+LEAD: <the concrete detail or contrast to open with> | <fact ids, e.g. C2, C5>
+SECTION: <specific heading> | <prose, list, timeline or qa> | <what this part must make the reader understand> | <fact ids>
+SECTION: ...
+DISAGREEMENTS: <where outlets differ or what is still unknown, or none>
+ANALOGY: <one everyday comparison that makes the core idea click, with no numbers or factual claims, or none>
+AD: <NAME> | <number>   (optional, only if useful)"""
+
+
+def parse_plan(raw, cards, ads):
+    ids = {c["id"] for c in cards}
+
+    def pick_ids(s):
+        out = []
+        for n in re.findall(r"C(\d+)", s):
+            cid = f"C{n}"
+            if cid in ids and cid not in out:
+                out.append(cid)
+        return out
+
+    def low(v):
+        return "" if not v or v.lower().strip(" .") in ("none", "n/a", "no") else v
+
+    plan = {"angle": hdr("ANGLE", raw), "focus": re.sub(r"[*\"]", "", hdr("FOCUS", raw)),
+            "fmt": re.sub(r"[*#\"]", "", hdr("FORMAT", raw))[:60] or "explainer",
+            "voice": re.sub(r"[*#\"]", "", hdr("VOICE", raw))[:80] or "clear and friendly",
+            "gaps": low(hdr("DISAGREEMENTS", raw)), "analogy": low(hdr("ANALOGY", raw)),
+            "lead": None, "sections": [], "ads": {}}
+    m = re.search(r"^[ \t]*\**LEAD\**[ \t]*:[ \t]*(.+)$", raw, re.I | re.M)
+    if m:
+        plan["lead"] = {"idea": m.group(1).split("|")[0].strip(" *"), "ids": pick_ids(m.group(1))}
+    for line in re.findall(r"^[ \t]*\**SECTION\**[ \t]*:[ \t]*(.+)$", raw, re.I | re.M):
+        parts = [x.strip(" *") for x in line.split("|")]
+        if len(parts) < 3:
+            continue
+        head = re.sub(r"^\d+[.)]\s*", "", parts[0]).strip(' "*')
+        form = next((f for f in FORMS if f in parts[1].lower()), "prose")
+        if len(head) < 4:
+            continue
+        plan["sections"].append({"heading": head[:90], "form": form, "purpose": parts[2], "ids": pick_ids(line)})
+    for line in re.findall(r"^[ \t]*\**AD\**[ \t]*:[ \t]*(.+)$", raw, re.I | re.M):
+        parts = [x.strip(" *") for x in line.split("|")]
+        if len(parts) >= 2 and parts[0] in ads:
+            n = re.search(r"\d+", parts[1])
+            if n:
+                plan["ads"][parts[0]] = int(n.group())
+    if len(plan["sections"]) < 3:
+        return None
+    plan["sections"] = plan["sections"][:5]
+    return plan
+
+
+def fallback_plan(cards):
+    return {"angle": "", "focus": "", "fmt": "straight explainer", "voice": "clear and friendly", "gaps": "", "analogy": "",
+            "lead": {"idea": "the single most striking specific detail", "ids": []}, "ads": {},
+            "sections": [
+                {"heading": "What we know so far", "form": "prose", "purpose": "the confirmed facts of the story", "ids": []},
+                {"heading": "How it got here", "form": "prose", "purpose": "the context that explains why this happened", "ids": []},
+                {"heading": "What happens next", "form": "prose", "purpose": "what is still unknown and what to watch", "ids": []}]}
+
+
+def assign_cards(plan, cards):
+    byid = {c["id"]: c for c in cards}
+    used = set()
+    if not plan["lead"]:
+        plan["lead"] = {"idea": "the single most striking specific detail", "ids": []}
+    parts = [plan["lead"]] + plan["sections"]
+    for p in parts:
+        ids = [i for i in p["ids"] if i not in used]
+        used.update(ids)
+        p["cards"] = [byid[i] for i in ids]
+    leftover = [c for c in cards if c["id"] not in used]
+    plan["lead"]["cards"] = (plan["lead"]["cards"] + leftover[:2])[:3] if not plan["lead"]["cards"] else plan["lead"]["cards"]
+    leftover = [c for c in leftover if c not in plan["lead"]["cards"]]
+    for sec in plan["sections"]:
+        while len(sec["cards"]) < 3 and leftover:
+            sec["cards"].append(leftover.pop(0))
+    i = 0
+    while leftover and plan["sections"]:
+        sec = plan["sections"][i % len(plan["sections"])]
+        if len(sec["cards"]) < 6:
+            sec["cards"].append(leftover.pop(0))
+        i += 1
+        if i > 60:
+            break
+
+
+def part_prompt(plan, part, is_lead, covered, prev_last, first_section):
+    facts = "\n".join(card_line(c) for c in part["cards"]) or "(no specific facts assigned; keep it short and general)"
+    done = "\n".join(f"- {x}" for x in covered) or "- nothing yet"
+    gaps = f"\nKnown disagreements or unknowns across the sources (mention only if it belongs in this part): {plan['gaps']}" if plan["gaps"] else ""
+    analogy = (f"\nIf it truly fits, use this everyday comparison once, in your own words: {plan['analogy']}"
+               if plan["analogy"] and first_section else "")
+    focus = f'\nWork the phrase "{plan["focus"]}" in naturally.' if plan["focus"] and is_lead else ""
+    rules = f"""RULES:
+- Use at least {min(3, max(1, len(part['cards'])))} of the facts above and keep their specific details exactly (numbers, names, dates, places).
+- Do not repeat anything already covered. Do not summarise the whole post, do not conclude, do not write a heading.
+- Vary how you attribute: name an outlet only when it adds credibility or when outlets differ; never start more than one sentence with "According to".
+- Do not put words in quotation marks unless copied word for word from a fact.
+- Write plain text. Wrap one or two key phrases in **double asterisks**. No other markdown, no HTML.
+- Avoid filler and stock phrases. Be concrete."""
+    if is_lead:
+        task = (f"Write the OPENING paragraph (2 or 3 sentences, 50 to 90 words) of the post. Open with: {part['idea']}.\n"
+                "Make a reader want to continue, and say plainly what the story is about.")
+    else:
+        task = (f'Write the part titled "{part["heading"]}". Purpose: {part["purpose"]}.\n'
+                f"FORM: {FORMS[part['form']]}")
+    prev = f'\nThe previous part ended with: "{prev_last}"' if prev_last else ""
+    return f"""You are writing ONE part of a news explainer post.
+Story angle: {plan['angle'] or 'explain the story clearly'}
+Narrator voice: {plan['voice']}
+
+{task}
+
+FACTS YOU MAY USE (each is from a named outlet):
+{facts}
+
+ALREADY COVERED EARLIER (do not repeat):
+{done}{prev}{gaps}{analogy}{focus}
+
+{rules}
+
+Output only the text of this part."""
+
+
+def clean_part(text, heading):
+    t = re.sub(r"```\w*", "", text).strip()
+    out = []
+    for i, l in enumerate(t.splitlines()):
+        s = l.strip()
+        if i < 2 and s and (re.sub(r"[^a-z0-9]", "", s.lower()) == re.sub(r"[^a-z0-9]", "", heading.lower()) or re.match(r"^#+\s", s)):
+            continue
+        if re.match(r"^(here is|here's|sure|certainly|okay)\b", s, re.I):
+            continue
+        s = re.sub(r"^\*\s+", "- ", s)
+        s = re.sub(r"^#+\s*", "", s)
+        out.append(s)
+    return "\n".join(out).strip()
+
+
+def scrub(text, seen):
+    """Remove clichés and sentences that repeat something already written."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^(\s*(?:[-\u2022]\s+|Q:\s*|A:\s*)?)(.*)$", line)
+        prefix, rest = m.group(1), m.group(2).strip()
+        if not rest:
+            out.append("")
+            continue
+        keep = []
+        for s in SENT_SPLIT.split(rest):
+            low = s.lower()
+            tk = toks(s)
+            if any(b in low for b in HARD_BANNED):
+                continue
+            if len(tk) >= 6 and any(similar(tk, t, 0.6, 0.85) for t in seen):
+                continue
+            keep.append(s)
+            if len(tk) >= 6:
+                seen.append(tk)
+        if keep:
+            out.append(prefix + " ".join(keep))
+    return "\n".join(out)
+
+
+def inline(t):
+    t = htmlmod.escape(t, quote=False)
+    return re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t).replace("**", "")
+
+
+def render_part(form, text):
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    faq = []
+    if form == "qa":
+        pairs = re.findall(r"Q:\s*(.+?)\s*\n+\s*A:\s*(.+?)(?=\n+\s*Q:|\Z)", "\n".join(lines), re.S)
+        if pairs:
+            h = ""
+            for q, a in pairs:
+                q = q.strip()
+                a = " ".join(a.split())
+                if not q.endswith("?"):
+                    q += "?"
+                h += f"<h3>{inline(q)}</h3><p>{inline(a)}</p>"
+                faq.append((q.replace("**", ""), a.replace("**", "")[:600]))
+            return h, faq
+        form = "prose"
+    if form == "list" and any(l.startswith("- ") for l in lines):
+        h, items = "", []
+        for l in lines:
+            if l.startswith("- "):
+                items.append(l[2:])
+            else:
+                if items:
+                    h += "<ul>" + "".join(f"<li>{inline(i)}</li>" for i in items) + "</ul>"
+                    items = []
+                h += f"<p>{inline(l)}</p>"
+        if items:
+            h += "<ul>" + "".join(f"<li>{inline(i)}</li>" for i in items) + "</ul>"
+        return h, faq
+    if form == "timeline":
+        rows = [l for l in lines if re.match(r"^[^:]{2,40}:\s+\S", l)]
+        if len(rows) >= 3:
+            intro = [l for l in lines if l not in rows]
+            h = "".join(f"<p>{inline(l)}</p>" for l in intro)
+            h += "<ol>" + "".join(
+                f"<li><strong>{inline(r.split(':', 1)[0])}:</strong> {inline(r.split(':', 1)[1].strip())}</li>" for r in rows) + "</ol>"
+            return h, faq
+    return "".join(f"<p>{inline(l)}</p>" for l in lines), faq
+
+
+def finish_prompt(article_text, focus, lead_title):
+    kw = f' Include the focus keyword "{focus}" naturally if it fits.' if focus else ""
+    return f"""Below is a finished news explainer article (plain text). Write its metadata.
+
+ARTICLE:
+{article_text}
+
+Reply in exactly this format and nothing else:
+TITLE: <headline under 62 characters, specific, no clickbait, not a copy of the first line.{kw}>
+DESCRIPTION: <meta description, max 150 characters>
+KEYWORDS: <focus keyword>, <3 to 5 related keywords>
+SUMMARY_HEADING: <short natural label for a summary box, such as "In short" or "The quick version">
+SUMMARY:
+<2 to 4 short sentences, or 3 to 4 short lines starting with '- ', that say what the topic is, what happened and why it matters. Use only facts present in the article and do not copy its opening paragraph.>"""
+
+
+def parse_finish(raw, fb_title, fb_desc):
+    raw = re.sub(r"```\w*", "", raw).strip()
+    title = re.sub(r"[*#\"]", "", hdr("TITLE", raw))[:100]
+    if len(title) < 8:
+        title = fb_title[:100]
+    desc = re.sub(r"[*#]", "", hdr("DESCRIPTION", raw))[:155]
+    if len(desc) < 20:
+        desc = fb_desc[:150]
+    kws = [k.strip(" *\"'#") for k in hdr("KEYWORDS", raw).split(",")]
+    kws = [k for k in kws if 2 < len(k) <= 40][:6]
+    heading = re.sub(r"[*#\"]", "", hdr("SUMMARY_HEADING", raw))[:40] or "In Short"
+    m = re.search(r"^[ \t]*\**SUMMARY\**[ \t]*:[ \t]*(.*)\Z", raw, re.I | re.M | re.S)
+    summary = m.group(1).strip() if m else ""
+    return {"title": title, "desc": desc, "kws": kws, "heading": heading, "summary": summary}
+
+
 def summary_html(s, fallback):
-    lines = [l.strip() for l in s.strip().splitlines() if l.strip()]
+    lines = [l.strip() for l in s.splitlines() if l.strip()]
     if not lines:
         return f"<p>{htmlmod.escape(fallback)}</p>"
     bullets = [re.sub(r"^[-*\u2022]\s+", "", l) for l in lines if re.match(r"^[-*\u2022]\s+", l)]
     if len(bullets) >= 2:
-        return "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
-    return "<p>" + " ".join(lines) + "</p>"
-
-
-def parse_output(raw, fallback_title):
-    raw = re.sub(r"```(?:html)?", "", raw).strip()
-    title = re.sub(r"[*#\"]", "", hdr("TITLE", raw))[:100]
-    if len(title) < 8:
-        title = fallback_title[:100]
-    desc = re.sub(r"[*#]", "", hdr("DESCRIPTION", raw))[:155]
-    kws = [k.strip(" *\"'#") for k in hdr("KEYWORDS", raw).split(",")]
-    kws = [k for k in kws if 2 < len(k) <= 40][:6]
-    fmt = re.sub(r"[*#\"]", "", hdr("FORMAT", raw))[:60] or "explainer"
-    heading = re.sub(r"[*#\"]", "", hdr("SUMMARY_HEADING", raw))[:40] or "In Short"
-    m = re.search(r"^[ \t]*\**SUMMARY\**[ \t]*:[ \t]*(.*?)^[ \t]*-{3,}[ \t]*$", raw, re.I | re.M | re.S)
-    if m:
-        summary, body = m.group(1).strip(), raw[m.end():].strip()
-    else:
-        idx = list(re.finditer(r"^[ \t]*\**(TITLE|DESCRIPTION|KEYWORDS|FORMAT|SUMMARY_HEADING)\**[ \t]*:.*$", raw, re.I | re.M))
-        body = re.sub(r"^\s*-{3,}\s*", "", raw[idx[-1].end():].strip() if idx else raw)
-        summary = ""
-    if len(body) < 400:
-        return None
-    if not re.search(r"<(p|h2|h3|ul)\b", body):
-        body = md_to_html(body)
-    bold = lambda x: re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", x)
-    body = bold(body)
-    if len(desc) < 20:
-        desc = clean(body)[:150]
-    return {"title": title, "desc": desc, "kws": kws, "fmt": fmt, "heading": heading,
-            "summary": bold(summary_html(summary, desc)), "body": body}
-
-
-def sanitize(body):
-    soup = BeautifulSoup(body, "lxml")
-    for t in soup(["script", "style", "iframe", "h1", "form", "link", "meta", "img"]):
-        t.decompose()
-    for t in soup.find_all(True):
-        for a in list(t.attrs):
-            if a != "href":
-                del t.attrs[a]
-        if t.name == "a":
-            t["rel"] = "noopener"
-            t["target"] = "_blank"
-    return soup
-
-
-NUM = re.compile(r"\d[\d,]*\.?\d*")
-QUOTE = re.compile(r'["\u201c]([^"\u201d]{25,})["\u201d]')
+        return "<ul>" + "".join(f"<li>{inline(b)}</li>" for b in bullets) + "</ul>"
+    return "<p>" + inline(" ".join(lines)) + "</p>"
 
 
 def nn(s):
@@ -748,9 +944,9 @@ def fact_check(soup, src):
     removed = 0
     for el in soup.find_all(["p", "li"]):
         txt = el.get_text(" ").strip()
-        if "[[AD:" in txt or not txt:
+        if not txt:
             continue
-        sents = re.split(r"(?<=[.!?])\s+", txt)
+        sents = SENT_SPLIT.split(txt)
         keep = []
         for s in sents:
             bad_num = [n for n in NUM.findall(s) if len(nn(n)) > 1 and nn(n) not in known]
@@ -771,36 +967,13 @@ def inner_html(soup):
     return soup.body.decode_contents() if soup.body else str(soup)
 
 
-def faq_pairs(soup):
-    out = []
-    for h in soup.find_all(["h2", "h3"]):
-        q = h.get_text(" ").strip()
-        if q.endswith("?"):
-            p = h.find_next_sibling()
-            if p is not None and p.name == "p":
-                a = p.get_text(" ").strip()
-                if len(a) > 30:
-                    out.append((q, a[:600]))
-    return out[:5]
-
-
 # ---------------- ads ----------------
 def ads_available():
     return {n: os.getenv(n, "").strip() for n in AD_HINTS if os.getenv(n, "").strip()}
 
 
-def place_ads(html_body, ads):
-    used = set()
-
-    def rep(m):
-        n = m.group(1)
-        if n in ads and n not in used:
-            used.add(n)
-            return f'<div style="text-align:center;margin:24px 0;overflow:hidden">{ads[n]}</div>'
-        return ""
-
-    html_body = re.sub(r"(?:<p>\s*)?\[\[AD:([A-Z0-9_]+)\]\](?:\s*</p>)?", rep, html_body)
-    return re.sub(r"\[\[AD:[^\]]*\]\]", "", html_body)
+def ad_div(code):
+    return f'<div style="text-align:center;margin:24px 0;overflow:hidden">{code}</div>'
 
 
 def adsense_loader():
@@ -847,14 +1020,14 @@ def assemble(cat, p, summary_inner, body_inner, img, members, words, related, fa
     ld = ld_script(article)
     if len(faq) >= 2:
         ld += ld_script({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [
-            {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in faq]})
+            {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in faq[:5]]})
     return (f'<div class="news-post">{adsense_loader()}{byline}{fig}{box}{body_inner}{related}'
             f'<p style="font-size:13px;color:#555"><em>Sources: {links}</em></p>{ld}</div>')
 
 
 # ---------------- pipeline ----------------
 def build_post(cat, cl, st, best):
-    lead = cl[0]["title"]
+    lead_title = cl[0]["title"]
     # up to 6 different outlets (newest first); the 5 with the most usable text are used
     members, used = [], set()
     for m in sorted(cl, key=lambda m: m["ts"], reverse=True):
@@ -875,72 +1048,110 @@ def build_post(cat, cl, st, best):
     # an image is mandatory: check this first so no AI time is wasted
     img = pick_image(infos, cl)
     if not img:
-        note(f"[{cat}] SKIPPED (no working image found): {lead}")
+        note(f"[{cat}] SKIPPED (no working image found): {lead_title}")
         return None
 
     infos = [i for i in infos if len(i[1]) >= 120][:MAX_SOURCES]
-    total = sum(len(i[1]) for i in infos)
-    if total < 400:
-        note(f"[{cat}] SKIPPED (too little source text, {total} chars): {lead}")
-        return None
     chosen = [i[0] for i in infos]
-
-    def block(n, m, facts, limit):
-        return f"SOURCE {n} - {m['source']}\nHeadline: {m['title']}\nSummary: {m['summary'][:400]}\nDetails: {facts[:limit]}"
-
-    research_blocks = "\n\n".join(block(n, m, f, 2000) for n, (m, f, _) in enumerate(infos, 1))
-    writer_blocks = "\n\n".join(block(n, m, f, 1200) for n, (m, f, _) in enumerate(infos, 1))
+    cards = extract_cards(infos)
+    if len(cards) < 8:
+        note(f"[{cat}] SKIPPED (only {len(cards)} specific facts found): {lead_title}")
+        return None
     outlets = ", ".join(m["source"] for m in chosen)
-
     gn_rel = best["rel"] if best else []
     gn_lines = "\n".join(f"- {h} ({o})" for h, o in gn_rel) or "- none"
-
-    # pass 1: research / fact sheet
-    t0 = time.time()
-    fact_sheet = llm(RESEARCH_SYS, research_prompt(research_blocks), num_predict=900, temp=0.2).strip()
-    log(f"research pass: {time.time() - t0:.0f}s, {len(fact_sheet.split())} words")
-    if len(fact_sheet) < 200:
-        fact_sheet = "(not available - rely on the source excerpts)"
-
-    # pass 2: writing (AI chooses the structure)
     ads = ads_available()
-    recent = ", ".join(st["formats"][-6:]) or "none yet"
+
+    # step 1: the AI plans angle, voice, structure and ad placement
     t0 = time.time()
-    raw = llm(WRITER_SYS, writer_prompt(cat, fact_sheet, writer_blocks, outlets, gn_lines, recent, ads),
-              num_predict=3000, temp=0.8)
-    log(f"writing pass: {time.time() - t0:.0f}s, {len(raw.split())} words")
-    p = parse_output(raw, lead)
-    if not p:
-        note(f"[{cat}] SKIPPED (AI output unusable): {lead}")
+    plan = None
+    for attempt in range(2):
+        raw = llm(PLAN_SYS, plan_prompt(cat, cards, outlets, gn_lines, ", ".join(st["formats"][-6:]) or "none yet",
+                                        ", ".join(st["voices"][-4:]) or "none yet", ads),
+                  num_predict=750, temp=0.75 if attempt == 0 else 0.5)
+        plan = parse_plan(raw, cards, ads)
+        if plan:
+            break
+    if not plan:
+        note(f"[{cat}] planner output unusable, using fallback outline")
+        plan = fallback_plan(cards)
+    assign_cards(plan, cards)
+    log(f"plan ({time.time() - t0:.0f}s): format='{plan['fmt']}', voice='{plan['voice']}', focus='{plan['focus']}', "
+        f"sections={[(s['heading'], s['form'], len(s['cards'])) for s in plan['sections']]}")
+
+    # step 2: write the opening and each section separately
+    seen, covered, faq = [], [], []
+    body_parts, article_text = [], []
+    prev_last = ""
+    ad_after = {}
+    for name, k in plan["ads"].items():
+        ad_after.setdefault(k, name)
+
+    lead_raw = llm(WRITER_SYS, part_prompt(plan, plan["lead"], True, covered, prev_last, False), num_predict=260, temp=0.8)
+    lead_text = scrub(clean_part(lead_raw, ""), seen)
+    if len(lead_text.split()) < 20:
+        note(f"[{cat}] SKIPPED (AI wrote no usable opening): {lead_title}")
         return None
-    if is_dup([toks(p["title"])], st):
-        note(f"[{cat}] SKIPPED (generated title duplicates an earlier post): {p['title']}")
+    h, _ = render_part("prose", lead_text)
+    body_parts.append(h)
+    article_text.append(lead_text)
+    covered.append(SENT_SPLIT.split(lead_text)[0][:140])
+    prev_last = SENT_SPLIT.split(lead_text)[-1][:160]
+    if 0 in ad_after and ad_after[0] in ads:
+        body_parts.append(ad_div(ads[ad_after[0]]))
+
+    kept = 0
+    for i, sec in enumerate(plan["sections"], 1):
+        raw = llm(WRITER_SYS, part_prompt(plan, sec, False, covered, prev_last, kept == 0), num_predict=560, temp=0.8)
+        text = scrub(clean_part(raw, sec["heading"]), seen)
+        if len(text.split()) < 40:
+            log(f"section '{sec['heading']}' too short, dropped")
+            continue
+        h, f = render_part(sec["form"], text)
+        faq += f
+        body_parts.append(f"<h2>{inline(sec['heading'])}</h2>{h}")
+        article_text.append(sec["heading"] + "\n" + text)
+        covered.append(sec["heading"] + ": " + SENT_SPLIT.split(text)[0][:120])
+        prev_last = SENT_SPLIT.split(text)[-1][:160]
+        kept += 1
+        if i in ad_after and ad_after[i] in ads:
+            body_parts.append(ad_div(ads[ad_after[i]]))
+    log(f"writing finished in {time.time() - t0:.0f}s, sections kept: {kept}")
+    if kept < 3:
+        note(f"[{cat}] SKIPPED (only {kept} usable sections): {lead_title}")
         return None
 
-    src = " ".join([m["title"] + " " + m["summary"] for m in cl] + [i[1] for i in infos]
-                   + [h + " " + o for h, o in gn_rel])
-    body_soup = sanitize(p["body"])
+    # step 3: title, description, keywords and summary are written last, from the finished article
+    full_text = "\n\n".join(article_text)[:5500]
+    fin = parse_finish(llm(WRITER_SYS, finish_prompt(full_text, plan["focus"], lead_title), num_predict=420, temp=0.5),
+                       lead_title, clean(article_text[0])[:150])
+    if is_dup([toks(fin["title"])], st):
+        note(f"[{cat}] SKIPPED (generated title duplicates an earlier post): {fin['title']}")
+        return None
+
+    # step 4: fact verification against all source material
+    src = " ".join([m["title"] + " " + m["summary"] for m in cl] + [i[1] for i in infos] + [h + " " + o for h, o in gn_rel])
+    body_soup = BeautifulSoup("".join(body_parts), "lxml")
     fact_check(body_soup, src)
     words = len(body_soup.get_text().split())
     if words < MIN_WORDS:
-        note(f"[{cat}] SKIPPED (article only {words} words after checks): {lead}")
+        note(f"[{cat}] SKIPPED (article only {words} words after checks): {lead_title}")
         return None
-    sum_soup = sanitize(p["summary"])
+    sum_soup = BeautifulSoup(summary_html(fin["summary"], fin["desc"]), "lxml")
     fact_check(sum_soup, src)
     summary_inner = inner_html(sum_soup)
     if len(sum_soup.get_text().split()) < 8:
-        summary_inner = f"<p>{esc(p['desc'])}</p>"
+        summary_inner = f"<p>{esc(fin['desc'])}</p>"
 
-    faq = faq_pairs(body_soup)
-    body_inner = place_ads(inner_html(body_soup), ads)
-    related = related_block(st, cat, toks(p["title"]) | {k for kw in p["kws"] for k in toks(kw)})
-    html_out = assemble(cat, p, summary_inner, body_inner, img, chosen, words, related, faq)
+    related = related_block(st, cat, toks(fin["title"]) | {k for kw in fin["kws"] for k in toks(kw)})
+    html_out = assemble(cat, fin, summary_inner, inner_html(body_soup), img, chosen, words, related, faq)
     tags = []
-    for k in p["kws"]:
-        k = re.sub(r"[,]", " ", k).strip()
+    for k in fin["kws"]:
+        k = k.replace(",", " ").strip()
         if k and k.lower() != cat.lower() and k.lower() not in [t.lower() for t in tags]:
             tags.append(k)
-    return {"title": p["title"], "html": html_out, "labels": [cat] + tags[:4], "fmt": p["fmt"], "words": words}
+    return {"title": fin["title"], "html": html_out, "labels": [cat] + tags[:4], "fmt": plan["fmt"],
+            "voice": plan["voice"], "words": words}
 
 
 def process(cat, st, trends):
@@ -976,6 +1187,7 @@ def process(cat, st, trends):
         st["seen"].extend(ids)
         st["write_ok"] = True
         st["formats"].append(res["fmt"])
+        st["voices"].append(res["voice"])
         record_topic(st, cat, titles[:6], res["title"], url)
         note(f"POSTED [{cat}] ({res['words']} words, structure: {res['fmt']}): {res['title']} -> {url}")
         return True
