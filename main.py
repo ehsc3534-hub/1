@@ -1,7 +1,7 @@
-import calendar, hashlib, json, os, re, sys, time, warnings
+import calendar, hashlib, html as htmlmod, json, os, re, sys, time, warnings
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import feedparser
 import requests
@@ -14,12 +14,12 @@ OLLAMA = "http://127.0.0.1:11434"
 STATE_FILE = "state.json"
 SITE_NAME = os.getenv("SITE_NAME") or "Newsroom"
 MAX_CLUSTER_TRIES = 4      # topics tried per category per run
-MAX_SOURCES = 3            # outlets whose facts are given to the AI
+MAX_SOURCES = 5            # outlets whose facts are given to the AI
 MAX_FAILS = 5
-TIME_BUDGET = 40 * 60
+TIME_BUDGET = 45 * 60
 TOPIC_WINDOW = 30 * 86400  # a topic is blocked from repeating for 30 days
 ITEM_AGE = 72 * 3600
-MIN_WORDS = 200
+MIN_WORDS = 350
 BLOGGER_SCOPE = "https://www.googleapis.com/auth/blogger"
 
 S = requests.Session()
@@ -33,35 +33,62 @@ NPR = "https://feeds.npr.org/"
 CNN = "http://rss.cnn.com/rss/"
 CNBC = "https://www.cnbc.com/id/"
 MW = "https://feeds.content.dowjones.io/public/rss/"
+WP = "https://feeds.washingtonpost.com/rss/"
 
 # Edit freely. Dead or paywalled feeds are skipped automatically.
 CATEGORIES = {
-    "World News": [BBC + "world/rss.xml", "https://www.aljazeera.com/xml/rss/all.xml", SKY + "world.xml",
-                   NPR + "1004/rss.xml", CNN + "edition_world.rss", NYT + "World.xml"],
-    "Political": [BBC + "politics/rss.xml", GUA + "politics/rss", SKY + "politics.xml", NPR + "1014/rss.xml", NYT + "Politics.xml"],
-    "Business": [BBC + "business/rss.xml", SKY + "business.xml", NPR + "1006/rss.xml", NYT + "Business.xml", GUA + "uk/business/rss"],
+    "World News": [BBC + "world/rss.xml", "https://www.aljazeera.com/xml/rss/all.xml", SKY + "world.xml", NPR + "1004/rss.xml",
+                   CNN + "edition_world.rss", NYT + "World.xml", GUA + "world/rss", "https://rss.dw.com/rdf/rss-en-world",
+                   "https://www.france24.com/en/rss", WP + "world", "https://abcnews.go.com/abcnews/internationalheadlines",
+                   "https://www.cbsnews.com/latest/rss/world"],
+    "Political": [BBC + "politics/rss.xml", GUA + "politics/rss", SKY + "politics.xml", NPR + "1014/rss.xml", NYT + "Politics.xml",
+                  WP + "politics", "https://www.cbsnews.com/latest/rss/politics", "https://abcnews.go.com/abcnews/politicsheadlines",
+                  "https://thehill.com/feed/"],
+    "Business": [BBC + "business/rss.xml", SKY + "business.xml", NPR + "1006/rss.xml", NYT + "Business.xml", GUA + "uk/business/rss",
+                 CNBC + "100003114/device/rss/rss.html", "https://fortune.com/feed/", "https://www.forbes.com/business/feed/",
+                 WP + "business"],
     "Technology": [BBC + "technology/rss.xml", "https://www.theverge.com/rss/index.xml", "https://techcrunch.com/feed/",
-                   SKY + "technology.xml", CNN + "edition_technology.rss", NPR + "1019/rss.xml"],
+                   SKY + "technology.xml", CNN + "edition_technology.rss", NPR + "1019/rss.xml", "https://www.wired.com/feed/rss",
+                   "https://feeds.arstechnica.com/arstechnica/index", "https://www.engadget.com/rss.xml", GUA + "technology/rss"],
     "Science": [BBC + "science_and_environment/rss.xml", "https://www.sciencedaily.com/rss/all.xml", NYT + "Science.xml",
-                NPR + "1007/rss.xml", CNN + "edition_space.rss"],
-    "Health": [BBC + "health/rss.xml", NYT + "Health.xml", GUA + "society/health/rss", NPR + "1128/rss.xml", CNN + "cnn_health.rss"],
-    "Education": [BBC + "education/rss.xml", GUA + "education/rss", NYT + "Education.xml"],
-    "Movie": [GUA + "film/rss", "https://variety.com/v/film/feed/", NYT + "Movies.xml", SKY + "entertainment.xml", CNN + "edition_entertainment.rss"],
+                NPR + "1007/rss.xml", CNN + "edition_space.rss", "https://www.space.com/feeds/all", "https://phys.org/rss-feed/",
+                "https://www.livescience.com/feeds/all", GUA + "science/rss"],
+    "Health": [BBC + "health/rss.xml", NYT + "Health.xml", GUA + "society/health/rss", NPR + "1128/rss.xml", CNN + "cnn_health.rss",
+               "https://www.statnews.com/feed/", "https://www.who.int/rss-feeds/news-english.xml",
+               "https://www.sciencedaily.com/rss/health_medicine.xml"],
+    "Education": [BBC + "education/rss.xml", GUA + "education/rss", NYT + "Education.xml", "https://www.insidehighered.com/rss.xml",
+                  "https://www.timeshighereducation.com/rss.xml"],
+    "Movie": [GUA + "film/rss", "https://variety.com/v/film/feed/", NYT + "Movies.xml", SKY + "entertainment.xml",
+              CNN + "edition_entertainment.rss", "https://www.hollywoodreporter.com/c/movies/feed/", "https://deadline.com/feed/",
+              "https://www.indiewire.com/feed/"],
     "Sports": ["http://feeds.bbci.co.uk/sport/rss.xml", "https://www.espn.com/espn/rss/news", GUA + "sport/rss",
-               CNN + "edition_sport.rss", NYT + "Sports.xml"],
-    "Finance": [MW + "mw_topstories", CNBC + "10000664/device/rss/rss.html", CNBC + "100003114/device/rss/rss.html", GUA + "business/rss"],
-    "Economy": [NYT + "Economy.xml", GUA + "business/economics/rss", CNBC + "20910258/device/rss/rss.html", BBC + "business/rss.xml"],
-    "Banking": [GUA + "business/banking/rss", CNBC + "10000664/device/rss/rss.html", MW + "mw_topstories", BBC + "business/rss.xml"],
-    "Markets": [MW + "mw_marketpulse", CNBC + "15839069/device/rss/rss.html", BBC + "business/rss.xml", GUA + "business/rss"],
+               CNN + "edition_sport.rss", NYT + "Sports.xml", "https://www.skysports.com/rss/12040",
+               "https://www.cbssports.com/rss/headlines/", "https://sports.yahoo.com/rss/"],
+    "Finance": [MW + "mw_topstories", CNBC + "10000664/device/rss/rss.html", CNBC + "100003114/device/rss/rss.html",
+                GUA + "business/rss", "https://finance.yahoo.com/news/rssindex", "https://www.investing.com/rss/news.rss"],
+    "Economy": [NYT + "Economy.xml", GUA + "business/economics/rss", CNBC + "20910258/device/rss/rss.html", BBC + "business/rss.xml",
+                MW + "mw_topstories", "https://finance.yahoo.com/news/rssindex"],
+    "Banking": [GUA + "business/banking/rss", CNBC + "10000664/device/rss/rss.html", MW + "mw_topstories", BBC + "business/rss.xml",
+                "https://finance.yahoo.com/news/rssindex"],
+    "Markets": [MW + "mw_marketpulse", CNBC + "15839069/device/rss/rss.html", BBC + "business/rss.xml", GUA + "business/rss",
+                "https://finance.yahoo.com/news/rssindex", "https://www.investing.com/rss/news.rss"],
     "Crypto": ["https://cointelegraph.com/rss", "https://www.coindesk.com/arc/outboundfeeds/rss/", "https://decrypt.co/feed",
-               "https://cryptoslate.com/feed/", "https://bitcoinmagazine.com/.rss/full/"],
-    "Environment": [GUA + "environment/rss", GUA + "environment/climate-crisis/rss", NYT + "Climate.xml", BBC + "science_and_environment/rss.xml"],
-    "Travel": [NYT + "Travel.xml", GUA + "travel/rss", "https://www.cntraveler.com/feed/rss"],
-    "Lifestyle": [GUA + "lifeandstyle/rss", GUA + "fashion/rss", NYT + "Style.xml", NYT + "Well.xml"],
+               "https://cryptoslate.com/feed/", "https://bitcoinmagazine.com/.rss/full/", "https://bitcoinist.com/feed/",
+               "https://www.newsbtc.com/feed/"],
+    "Environment": [GUA + "environment/rss", GUA + "environment/climate-crisis/rss", NYT + "Climate.xml",
+                    BBC + "science_and_environment/rss.xml", "https://www.carbonbrief.org/feed", "https://news.mongabay.com/feed/",
+                    "https://insideclimatenews.org/feed/"],
+    "Travel": [NYT + "Travel.xml", GUA + "travel/rss", "https://www.cntraveler.com/feed/rss", "https://skift.com/feed/"],
+    "Lifestyle": [GUA + "lifeandstyle/rss", GUA + "fashion/rss", NYT + "Style.xml", NYT + "Well.xml", "https://lifehacker.com/feed/rss"],
     "Automotive": ["https://www.autoblog.com/rss.xml", "https://www.motor1.com/rss/articles/all/",
-                   "https://www.caranddriver.com/rss/all.xml/", "https://www.autocar.co.uk/rss"],
-    "Fact Check": ["https://www.snopes.com/feed/", "https://www.politifact.com/rss/all/", "https://www.factcheck.org/feed/"],
+                   "https://www.caranddriver.com/rss/all.xml/", "https://www.autocar.co.uk/rss", "https://electrek.co/feed/",
+                   "https://insideevs.com/rss/articles/all/", "https://jalopnik.com/rss"],
+    "Fact Check": ["https://www.snopes.com/feed/", "https://www.politifact.com/rss/all/", "https://www.factcheck.org/feed/",
+                   "https://leadstories.com/atom.xml", "https://fullfact.org/feed/all/"],
 }
+
+AGE_OVERRIDE = {"Fact Check": 7 * 86400, "Travel": 7 * 86400, "Lifestyle": 5 * 86400, "Education": 5 * 86400,
+                "Automotive": 5 * 86400, "Science": 5 * 86400, "Health": 5 * 86400}
 
 # Categories that share general business feeds only keep matching stories.
 FILTERS = {
@@ -72,6 +99,14 @@ FILTERS = {
     "Environment": ["climate", "environment", "wildlife", "pollution", "emission", "carbon", "nature", "energy", "flood", "wildfire",
                     "heat", "species", "ocean", "forest", "green"],
 }
+
+# Google News RSS (used to detect what is trending right now)
+GN_TOPIC = {"World News": "WORLD", "Business": "BUSINESS", "Technology": "TECHNOLOGY", "Science": "SCIENCE",
+            "Health": "HEALTH", "Sports": "SPORTS", "Movie": "ENTERTAINMENT"}
+GN_QUERY = {"Political": "politics", "Education": "education", "Finance": "finance", "Economy": "economy",
+            "Banking": "banking", "Markets": "stock market", "Crypto": "cryptocurrency",
+            "Environment": "climate change environment", "Travel": "travel", "Lifestyle": "lifestyle",
+            "Automotive": "cars automotive", "Fact Check": "fact check"}
 
 AD_HINTS = {
     "BANNER_468X60": "468x60 banner, fits between sections on desktop",
@@ -142,6 +177,7 @@ def load_state():
     st.setdefault("seen", [])
     st.setdefault("fails", 0)
     st.setdefault("topics", [])
+    st.setdefault("formats", [])
     st.setdefault("write_ok", False)
     return st
 
@@ -150,6 +186,7 @@ def save_state(st):
     now = time.time()
     st["topics"] = [t for t in st["topics"] if now - t["t"] < 45 * 86400][-600:]
     st["seen"] = st["seen"][-4000:]
+    st["formats"] = st["formats"][-12:]
     with open(STATE_FILE, "w") as f:
         json.dump(st, f)
 
@@ -183,9 +220,25 @@ def is_dup(token_sets, st):
     return False
 
 
-def record_topic(st, cat, member_titles, gen_title):
+def record_topic(st, cat, member_titles, gen_title, url):
     refs = [sorted(toks(x)) for x in member_titles + [gen_title]]
-    st["topics"].append({"t": time.time(), "cat": cat, "refs": refs})
+    st["topics"].append({"t": time.time(), "cat": cat, "refs": refs, "title": gen_title, "url": url})
+
+
+def related_block(st, cat, tk):
+    """Internal links to earlier posts (SEO + reader retention)."""
+    cands = [t for t in reversed(st["topics"]) if t.get("url") and t.get("title")]
+    pick = [t for t in cands if t.get("cat") == cat][:3]
+    if len(pick) < 3:
+        for t in cands:
+            if t not in pick and toks(t["title"]) & tk:
+                pick.append(t)
+            if len(pick) == 3:
+                break
+    if not pick:
+        return ""
+    items = "".join(f'<li><a href="{t["url"]}">{htmlmod.escape(t["title"])}</a></li>' for t in pick)
+    return f"<h2>Related Reading</h2><ul>{items}</ul>"
 
 
 # ---------------- Blogger ----------------
@@ -221,11 +274,11 @@ def hint_for(text):
     return "Check the secrets CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN and BLOG_ID."
 
 
-def blogger_post(title, content, label):
+def blogger_post(title, content, labels):
     r = S.post(
         f"https://www.googleapis.com/blogger/v3/blogs/{blog_id()}/posts/",
         headers={"Authorization": f"Bearer {access_token()}"},
-        json={"kind": "blogger#post", "title": title, "content": content, "labels": [label]},
+        json={"kind": "blogger#post", "title": title, "content": content, "labels": labels},
         timeout=60,
     )
     if r.status_code >= 300:
@@ -271,7 +324,6 @@ def preflight(st):
     tok = info["access_token"]
     h = {"Authorization": f"Bearer {tok}"}
     scopes = info.get("scope", "").split()
-    note(f"Token scopes: {scopes if scopes else 'not reported by Google'}")
     if scopes and BLOGGER_SCOPE not in scopes:
         fatal(f"Refresh token scopes are {scopes}, but writing posts needs {BLOGGER_SCOPE}. "
               "HOW TO FIX: create a new refresh token with that scope (not .readonly) and update the REFRESH_TOKEN secret.")
@@ -281,8 +333,6 @@ def preflight(st):
         fatal(f"{msg} | HOW TO FIX: {hint_for(msg)}")
     b = r.json()
     note(f"Blogger connection OK: '{b.get('name')}' ({b.get('url')}), existing posts: {b.get('posts', {}).get('totalItems')}")
-
-    # which blogs can THIS Google account actually write to?
     try:
         ub = S.get("https://www.googleapis.com/blogger/v3/users/self/blogs",
                    params=[("role", "ADMIN"), ("role", "AUTHOR")], headers=h, timeout=30)
@@ -290,20 +340,15 @@ def preflight(st):
             items = ub.json().get("items", [])
             ids = [str(i.get("id")) for i in items]
             listing = ", ".join(f"{i.get('name')} (id {i.get('id')})" for i in items) or "none"
-            note(f"Blogs this Google account can write to: {listing}")
             if blog_id() not in ids:
                 fatal(f"The Google account that created your REFRESH_TOKEN is NOT an Admin/Author of blog id {blog_id()} "
                       f"('{b.get('name')}'). It can only write to: {listing}. "
-                      "HOW TO FIX: create the refresh token again in OAuth Playground while signed in to the Google account "
-                      "that owns this blog (check blogger.com), or add the token's account as Admin in Blogger -> Settings -> "
-                      "Permissions and accept the invitation, then update the REFRESH_TOKEN secret.")
-        else:
-            note(f"Could not list this account's blogs (HTTP {ub.status_code}); continuing with write test")
+                      "HOW TO FIX: create the refresh token while signed in to the Google account that owns this blog, "
+                      "then update the REFRESH_TOKEN secret.")
     except SystemExit:
         raise
     except Exception as ex:
-        note(f"Could not list this account's blogs: {ex}")
-
+        log("could not list blogs:", ex)
     if not st.get("write_ok"):
         write_test(tok)
         st["write_ok"] = True
@@ -366,15 +411,47 @@ def fetch_trends():
         return []
 
 
+def gn_url(cat):
+    q = "hl=en-US&gl=US&ceid=US:en"
+    if cat in GN_TOPIC:
+        return f"https://news.google.com/rss/headlines/section/topic/{GN_TOPIC[cat]}?{q}"
+    return f"https://news.google.com/rss/search?q={quote_plus(GN_QUERY.get(cat, cat) + ' when:1d')}&{q}"
+
+
+def gn_signals(cat):
+    """Top Google News stories for this category: a trend signal + headlines from other outlets."""
+    try:
+        r = S.get(gn_url(cat), timeout=12)
+        fp = feedparser.parse(r.content)
+    except Exception:
+        return []
+    out = []
+    for idx, e in enumerate(fp.entries[:25]):
+        head = clean(e.get("title")).rsplit(" - ", 1)[0]
+        tk = toks(head)
+        if not tk:
+            continue
+        soup = BeautifulSoup(e.get("summary") or "", "lxml")
+        rel = []
+        for li in soup.find_all("li"):
+            a, f = li.find("a"), li.find("font")
+            if a:
+                rel.append((clean(a.get_text()), clean(f.get_text()) if f else ""))
+        out.append({"tk": tk, "w": min(12, len(rel)) + max(0, 10 - idx * 0.5), "rel": rel[:8], "head": head})
+    log(f"[{cat}] Google News signals: {len(out)}")
+    return out
+
+
 def collect(cat):
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=12) as ex:
         res = list(ex.map(fetch_feed, CATEGORIES[cat]))
     now = time.time()
+    age = AGE_OVERRIDE.get(cat, ITEM_AGE)
     kw = FILTERS.get(cat)
     pool = {}
     for r in res:
         for it in r:
-            if it["ts"] and now - it["ts"] > ITEM_AGE:
+            if it["ts"] and now - it["ts"] > age:
                 continue
             if kw and not any(k in (it["title"] + " " + it["summary"]).lower() for k in kw):
                 continue
@@ -396,14 +473,21 @@ def cluster(items):
     return cl
 
 
-def score(c, trends):
+def score(c, trends, gn):
     srcs = len({m["source"] for m in c})
     newest = max(m["ts"] for m in c)
     age_h = (time.time() - newest) / 3600 if newest else 72
     allt = set().union(*[m["tk"] for m in c])
     boost = min(24, sum(12 for T in trends if T <= allt))
+    best = None
+    for g in gn:
+        if any(similar(m["tk"], g["tk"], 0.25, 0.5) for m in c):
+            if best is None or g["w"] > best["w"]:
+                best = g
+    if best:
+        boost += min(30, 12 + best["w"])
     s = srcs * 10 + max(0, 48 - age_h) / 4 + (2 if any(m["image"] for m in c) else 0) + boost
-    return s, srcs, boost
+    return s, srcs, boost, best
 
 
 def fetch_page(url):
@@ -416,7 +500,7 @@ def fetch_page(url):
     img = upgrade_img(og.get("content")) if og and og.get("content") else None
     root = soup.find("article") or soup
     ps = [clean(p.get_text(" ")) for p in root.find_all("p")]
-    return " ".join(p for p in ps if len(p) > 50)[:5000], img
+    return " ".join(p for p in ps if len(p) > 50)[:6000], img
 
 
 def img_ok(u):
@@ -433,11 +517,11 @@ def img_ok(u):
         return False
 
 
-def pick_images(members, cl, pimgs):
+def pick_image(infos, cl):
+    """Return (url, outlet) of the first working image, or None. Every post needs exactly one."""
     ordered = []
-    for m in members:
-        ordered += [(m["image"], m["source"]), (m.get("image_raw"), m["source"])]
-    ordered += [(p, m["source"]) for m, p in zip(members, pimgs)]
+    for m, _, pimg in infos:
+        ordered += [(m["image"], m["source"]), (m.get("image_raw"), m["source"]), (pimg, m["source"])]
     for m in cl:
         ordered += [(m["image"], m["source"]), (m.get("image_raw"), m["source"])]
     cands, seen = [], set()
@@ -448,73 +532,33 @@ def pick_images(members, cl, pimgs):
     cands = cands[:10]
     with ThreadPoolExecutor(max_workers=8) as ex:
         ok = list(ex.map(lambda x: img_ok(x[0]), cands))
-    good = [c for c, g in zip(cands, ok) if g]
-    out, keys = [], set()
-    for u, s in good:
-        # avoid using two size-variants of the same picture
-        key = re.sub(r"/standard/\d+/|/news/\d+/", "/", u)
-        if key in keys:
-            continue
-        keys.add(key)
-        out.append((u, s))
-    return out[:2]
+    for c, good in zip(cands, ok):
+        if good:
+            return c
+    return None
 
 
 # ---------------- AI ----------------
-SYSTEM = (
-    "You are a senior news editor and blogger at a respected English-language news website. "
-    "You write clear, accurate, human-sounding blog posts. You never invent facts, numbers, quotes or names. "
-    "You only use the facts provided to you."
+RESEARCH_SYS = (
+    "You are a meticulous news research assistant. You extract only facts that are explicitly stated in the provided "
+    "source excerpts. You never guess and never add outside knowledge."
+)
+
+WRITER_SYS = (
+    "You are a staff writer at a news explainer website. You write like a smart, warm human journalist who helps readers "
+    "truly understand a story. You never invent facts, numbers, quotes or names, and you only use the material provided."
 )
 
 
-def make_prompt(cat, src_block, outlets, ads):
-    if ads:
-        lines = "\n".join(f"  [[AD:{n}]] = {AD_HINTS[n]}" for n in ads)
-        ad_txt = (
-            "Optional ad slots. Use only the ones that genuinely fit, each at most once, never before the first "
-            "paragraph, never two in a row. Skipping all of them is fine. To place one, put its marker alone on its own line:\n" + lines
-        )
-    else:
-        ad_txt = "There are no ad slots. Do not write any [[AD:...]] markers."
-    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
-    return f"""Write an original, professional blog-style news post for the "{cat}" section about this topic, which is trending right now. Today is {today}.
-
-SOURCES (several outlets covering the same story; these are the ONLY facts you may use):
-{src_block}
-
-STRUCTURE (blend all six parts into one flowing post):
-1. HOOK: open with a strong question, a surprising fact from the sources, or a small mystery. 2 to 3 sentences, no heading.
-2. BACKGROUND: an <h2> section that explains the context in simple words so readers see why this matters. Use only background found in the sources.
-3. CORE ANALYSIS: two or three <h2> sections that present the key details, arguments and evidence step by step (figures, reports, who said what), always attributed.
-4. STORYTELLING TONE: conversational and natural, like talking to a friend. Mix short punchy sentences with longer ones, address the reader as "you" sometimes. Stay factual and neutral.
-5. KEY POINTS: make it scannable. Wrap important phrases in <strong>. Include <h2>Key Takeaways</h2> with a <ul> of 3 to 5 <li> items.
-6. OUTRO: first <h2>What People Are Asking</h2> with 2 or 3 short <h3> questions readers would search, each followed by a <p> answer from the facts. Then a final <h2> (for example "The Bottom Line") with a brief summary and a closing open-ended question that invites readers to comment.
-
-RULES:
-- 700 to 900 words. Rewrite everything in fresh words; never copy sentences.
-- Headings must be natural and specific to the story. Never use labels like "The Hook".
-- Attribute claims naturally using only these outlet names: {outlets}. Do not add any number, date, quote or name that is not in the sources.
-- Banned phrases: "in conclusion", "delve", "in today's fast-paced world", "landscape", "tapestry", "it is important to note".
-- Headline: under 65 characters, specific, main keyword near the start, no clickbait.
-- Write the post body in simple HTML tags only: <p>, <h2>, <h3>, <ul>, <li>, <strong>. No <h1>, no images, no scripts, no markdown.
-- {ad_txt}
-
-OUTPUT FORMAT (exactly):
-TITLE: <headline>
-DESCRIPTION: <meta description, max 150 characters>
----
-<post html>"""
-
-
-def llm(system, user):
+def llm(system, user, num_predict=2400, temp=0.65):
     for attempt in range(2):
         try:
             r = requests.post(f"{OLLAMA}/api/chat", json={
                 "model": MODEL, "stream": False, "keep_alive": "30m",
-                "options": {"temperature": 0.65, "top_p": 0.9, "num_ctx": 8192, "num_predict": 2400},
+                "options": {"temperature": temp, "top_p": 0.92, "repeat_penalty": 1.08, "num_ctx": 10240,
+                            "num_predict": num_predict},
                 "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            }, timeout=1200)
+            }, timeout=1500)
             r.raise_for_status()
             return r.json()["message"]["content"]
         except requests.exceptions.ReadTimeout:
@@ -524,6 +568,71 @@ def llm(system, user):
             log("llm error:", ex)
             time.sleep(3)
     return ""
+
+
+def research_prompt(blocks):
+    return f"""Read these excerpts from several news outlets about ONE story and write a FACT SHEET for a writer.
+
+{blocks}
+
+Rules: use only facts stated in the excerpts. Put the outlet name in [brackets] after each fact. Keep exact numbers, dates, names and places. No opinions, no guesses.
+
+Output exactly these sections:
+WHAT HAPPENED: (2 to 3 lines)
+KEY FACTS: (bullets)
+BACKGROUND: (bullets)
+WHO SAYS WHAT: (bullets, only statements by named people or organisations)
+DISAGREEMENTS OR GAPS: (bullets: where outlets differ or details are missing)
+WHY IT MATTERS: (bullets, only if supported by the excerpts)"""
+
+
+def writer_prompt(cat, fact_sheet, excerpts, outlets, gn_lines, recent, ads):
+    if ads:
+        lines = "\n".join(f"  [[AD:{n}]] = {AD_HINTS[n]}" for n in ads)
+        ad_txt = (
+            "Optional ad slots. Use only the ones that genuinely fit, each at most once, never before the first "
+            "paragraph, never two in a row. Skipping all of them is fine. To place one, put its marker alone on its own line:\n" + lines
+        )
+    else:
+        ad_txt = "There are no ad slots. Do not write any [[AD:...]] markers."
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    return f"""Write a news EXPLAINER post for the "{cat}" section. Today is {today}. This story is trending right now.
+
+FACT SHEET (compiled from these outlets: {outlets}):
+{fact_sheet}
+
+SOURCE EXCERPTS:
+{excerpts}
+
+OTHER HEADLINES ON THIS STORY (Google News):
+{gn_lines}
+
+HOW TO WRITE IT (you decide the shape of the post):
+- Choose the best way to explain THIS story yourself. Ideas, not a checklist: a timeline, a question-led explainer, myth vs fact, both sides of the argument, a by-the-numbers breakdown, what changes for ordinary people, a cause-and-effect chain, what we know vs what we don't know yet. Invent a better one if it fits.
+- Structures recently used on this site (pick something DIFFERENT): {recent}
+- You decide how many sections there are, their order, and their headings. Headings must be specific to the story. A bullet list, short timeline or mini Q&A is allowed only where it truly helps. Do not add a FAQ or "key takeaways" unless this story needs one.
+- Write an original opening that fits the story; do not reuse a stock opening style.
+
+MUST-HAVES:
+1. SUMMARY: a short box at the very top (2 to 4 short sentences, or 3 to 4 short bullet lines) that tells the reader what the topic is, what happened and why it matters. It must stand on its own.
+2. Below it, the full explanation of 900 to 1200 words, drawing on several outlets so the reader gets the complete picture. Name the outlet when attributing ("according to ...").
+3. Explain jargon and background in plain words. If outlets disagree or details are missing, say so honestly.
+4. Use facts only from the fact sheet and excerpts. Do not invent numbers, dates, names or quotes. Do not put words in quotation marks unless they appear word-for-word in the excerpts.
+5. Human voice: vary sentence length, use contractions now and then, be concrete, skip filler. Avoid: "in conclusion", "delve", "landscape", "tapestry", "it's important to note", "in today's fast-paced world", "navigate", "game-changer", "shed light".
+6. SEO: choose one focus keyword phrase (2 to 4 words) and use it naturally in the headline, the summary, the first paragraph and at least one <h2>. Headline under 62 characters, specific, no clickbait.
+7. Body HTML uses only: <p>, <h2>, <h3>, <ul>, <ol>, <li>, <strong>, <em>. No <h1>, no images, no scripts, no markdown.
+8. {ad_txt}
+
+OUTPUT FORMAT (exactly, in this order):
+TITLE: <headline>
+DESCRIPTION: <meta description, max 150 characters>
+KEYWORDS: <focus keyword>, <3 to 5 related keywords>
+FORMAT: <3 to 6 word name of the structure you chose>
+SUMMARY_HEADING: <a short natural label for the summary box, such as "In short" or "The quick version">
+SUMMARY:
+<summary text>
+---
+<body html>"""
 
 
 def md_to_html(t):
@@ -560,29 +669,48 @@ def md_to_html(t):
     return "\n".join(out)
 
 
+def hdr(name, raw):
+    m = re.search(rf"^[ \t]*\**{name}\**[ \t]*:[ \t]*\**[ \t]*(.+?)[ \t]*\**[ \t]*$", raw, re.I | re.M)
+    return m.group(1).strip() if m else ""
+
+
+def summary_html(s, fallback):
+    lines = [l.strip() for l in s.strip().splitlines() if l.strip()]
+    if not lines:
+        return f"<p>{htmlmod.escape(fallback)}</p>"
+    bullets = [re.sub(r"^[-*\u2022]\s+", "", l) for l in lines if re.match(r"^[-*\u2022]\s+", l)]
+    if len(bullets) >= 2:
+        return "<ul>" + "".join(f"<li>{b}</li>" for b in bullets) + "</ul>"
+    return "<p>" + " ".join(lines) + "</p>"
+
+
 def parse_output(raw, fallback_title):
     raw = re.sub(r"```(?:html)?", "", raw).strip()
-    head = raw[:700]
-    t = re.search(r"title\s*:\s*\**\s*(.+)", head, re.I)
-    d = re.search(r"description\s*:\s*\**\s*(.+)", head, re.I)
-    start = 0
-    if d and (not t or d.start() > t.start()):
-        start = d.end()
-    elif t:
-        start = t.end()
-    body = re.sub(r"^\s*-{3,}\s*", "", raw[start:]).strip()
-    if len(body) < 200:
+    title = re.sub(r"[*#\"]", "", hdr("TITLE", raw))[:100]
+    if len(title) < 8:
+        title = fallback_title[:100]
+    desc = re.sub(r"[*#]", "", hdr("DESCRIPTION", raw))[:155]
+    kws = [k.strip(" *\"'#") for k in hdr("KEYWORDS", raw).split(",")]
+    kws = [k for k in kws if 2 < len(k) <= 40][:6]
+    fmt = re.sub(r"[*#\"]", "", hdr("FORMAT", raw))[:60] or "explainer"
+    heading = re.sub(r"[*#\"]", "", hdr("SUMMARY_HEADING", raw))[:40] or "In Short"
+    m = re.search(r"^[ \t]*\**SUMMARY\**[ \t]*:[ \t]*(.*?)^[ \t]*-{3,}[ \t]*$", raw, re.I | re.M | re.S)
+    if m:
+        summary, body = m.group(1).strip(), raw[m.end():].strip()
+    else:
+        idx = list(re.finditer(r"^[ \t]*\**(TITLE|DESCRIPTION|KEYWORDS|FORMAT|SUMMARY_HEADING)\**[ \t]*:.*$", raw, re.I | re.M))
+        body = re.sub(r"^\s*-{3,}\s*", "", raw[idx[-1].end():].strip() if idx else raw)
+        summary = ""
+    if len(body) < 400:
         return None
     if not re.search(r"<(p|h2|h3|ul)\b", body):
         body = md_to_html(body)
-    body = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", body)
-    title = re.sub(r"[*#\"]", "", t.group(1)).strip()[:100] if t else ""
-    if len(title) < 8:
-        title = fallback_title[:100]
-    desc = re.sub(r"[*#]", "", d.group(1)).strip()[:155] if d else ""
+    bold = lambda x: re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", x)
+    body = bold(body)
     if len(desc) < 20:
         desc = clean(body)[:150]
-    return title, desc, body
+    return {"title": title, "desc": desc, "kws": kws, "fmt": fmt, "heading": heading,
+            "summary": bold(summary_html(summary, desc)), "body": body}
 
 
 def sanitize(body):
@@ -594,23 +722,29 @@ def sanitize(body):
             if a != "href":
                 del t.attrs[a]
         if t.name == "a":
-            t["rel"] = "nofollow noopener"
+            t["rel"] = "noopener"
             t["target"] = "_blank"
     return soup
 
 
 NUM = re.compile(r"\d[\d,]*\.?\d*")
+QUOTE = re.compile(r'["\u201c]([^"\u201d]{25,})["\u201d]')
 
 
 def nn(s):
     return s.replace(",", "").rstrip(".")
 
 
+def normtxt(s):
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
+
+
 def fact_check(soup, src):
-    """Drop every sentence containing a number that is not present in the source facts."""
+    """Drop sentences with numbers or direct quotes that are not present in the source material."""
     now = datetime.now(timezone.utc)
     known = {nn(n) for n in NUM.findall(src)}
     known |= {str(now.year), str(now.year - 1), str(now.year + 1), str(now.day)}
+    src_norm = normtxt(src)
     removed = 0
     for el in soup.find_all(["p", "li"]):
         txt = el.get_text(" ").strip()
@@ -619,8 +753,9 @@ def fact_check(soup, src):
         sents = re.split(r"(?<=[.!?])\s+", txt)
         keep = []
         for s in sents:
-            bad = [n for n in NUM.findall(s) if len(nn(n)) > 1 and nn(n) not in known]
-            if bad:
+            bad_num = [n for n in NUM.findall(s) if len(nn(n)) > 1 and nn(n) not in known]
+            bad_quote = [q for q in QUOTE.findall(s) if normtxt(q) not in src_norm]
+            if bad_num or bad_quote:
                 removed += 1
             else:
                 keep.append(s)
@@ -630,6 +765,23 @@ def fact_check(soup, src):
             else:
                 el.decompose()
     log("fact-check removed sentences:", removed)
+
+
+def inner_html(soup):
+    return soup.body.decode_contents() if soup.body else str(soup)
+
+
+def faq_pairs(soup):
+    out = []
+    for h in soup.find_all(["h2", "h3"]):
+        q = h.get_text(" ").strip()
+        if q.endswith("?"):
+            p = h.find_next_sibling()
+            if p is not None and p.name == "p":
+                a = p.get_text(" ").strip()
+                if len(a) > 30:
+                    out.append((q, a[:600]))
+    return out[:5]
 
 
 # ---------------- ads ----------------
@@ -664,96 +816,131 @@ def adsense_loader():
 
 # ---------------- assemble ----------------
 def esc(s):
-    return s.replace('"', "&quot;")
+    return htmlmod.escape(s, quote=True)
 
 
-def figure(url, alt, source):
-    return (f'<figure style="margin:0 0 20px"><img src="{url}" alt="{esc(alt)}" '
-            f'style="width:100%;height:auto;border-radius:8px"/>'
-            f'<figcaption style="font-size:12px;color:#666">Image: {esc(source)}</figcaption></figure>')
+def ld_script(obj):
+    return '<script type="application/ld+json">' + json.dumps(obj).replace("</", "<\\/") + "</script>"
 
 
-def add_inline_image(inner, fig):
-    idx = [m.start() for m in re.finditer(r"<h2", inner)]
-    if len(idx) >= 2:
-        p = idx[min(2, len(idx) - 1)]
-        return inner[:p] + fig + inner[p:]
-    return inner
-
-
-def assemble(title, desc, inner, imgs, members):
-    hero = figure(imgs[0][0], title, imgs[0][1])
-    if len(imgs) > 1:
-        inner = add_inline_image(inner, figure(imgs[1][0], title, imgs[1][1]))
-    links = ", ".join(f'<a href="{m["link"]}" target="_blank" rel="nofollow noopener">{m["source"]}</a>' for m in members)
-    now = datetime.now(timezone.utc).isoformat()
-    ld = {
-        "@context": "https://schema.org", "@type": "NewsArticle", "headline": title, "description": desc,
-        "image": [i[0] for i in imgs], "datePublished": now, "dateModified": now,
+def assemble(cat, p, summary_inner, body_inner, img, members, words, related, faq):
+    now = datetime.now(timezone.utc)
+    iso, pretty = now.isoformat(), now.strftime("%B %d, %Y")
+    minutes = max(1, round(words / 200))
+    title = p["title"]
+    byline = (f'<p style="font-size:13px;color:#666;margin:0 0 14px">By {esc(SITE_NAME)} Staff &middot; '
+              f'<time datetime="{iso}">{pretty}</time> &middot; {esc(cat)} &middot; {minutes} min read</p>')
+    fig = (f'<figure style="margin:0 0 20px"><img src="{esc(img[0])}" alt="{esc(title)}" '
+           f'style="width:100%;height:auto;border-radius:8px"/>'
+           f'<figcaption style="font-size:12px;color:#666">Image: {esc(img[1])}</figcaption></figure>')
+    box = (f'<div style="border-left:4px solid #1a73e8;background:rgba(26,115,232,.08);padding:14px 18px;'
+           f'margin:0 0 24px;border-radius:6px"><p style="margin:0 0 8px"><strong>{esc(p["heading"])}</strong></p>'
+           f'{summary_inner}</div>')
+    links = ", ".join(f'<a href="{esc(m["link"])}" target="_blank" rel="noopener">{esc(m["source"])}</a>' for m in members)
+    article = {
+        "@context": "https://schema.org", "@type": "NewsArticle", "headline": title, "description": p["desc"],
+        "image": [img[0]], "datePublished": iso, "dateModified": iso, "articleSection": cat,
+        "keywords": p["kws"], "wordCount": words, "inLanguage": "en", "isAccessibleForFree": True,
         "author": {"@type": "Organization", "name": SITE_NAME},
         "publisher": {"@type": "Organization", "name": SITE_NAME},
     }
-    ld_html = '<script type="application/ld+json">' + json.dumps(ld).replace("</", "<\\/") + "</script>"
-    return (f'<div class="news-post">{adsense_loader()}{hero}{inner}'
-            f'<p style="font-size:13px;color:#555"><em>Sources: {links}</em></p>{ld_html}</div>')
+    ld = ld_script(article)
+    if len(faq) >= 2:
+        ld += ld_script({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": [
+            {"@type": "Question", "name": q, "acceptedAnswer": {"@type": "Answer", "text": a}} for q, a in faq]})
+    return (f'<div class="news-post">{adsense_loader()}{byline}{fig}{box}{body_inner}{related}'
+            f'<p style="font-size:13px;color:#555"><em>Sources: {links}</em></p>{ld}</div>')
 
 
 # ---------------- pipeline ----------------
-def build_post(cat, cl, st):
+def build_post(cat, cl, st, best):
     lead = cl[0]["title"]
-    # pick up to MAX_SOURCES different outlets, newest first
+    # up to 6 different outlets (newest first); the 5 with the most usable text are used
     members, used = [], set()
     for m in sorted(cl, key=lambda m: m["ts"], reverse=True):
         if m["source"] in used:
             continue
         used.add(m["source"])
         members.append(m)
-        if len(members) == MAX_SOURCES:
+        if len(members) == MAX_SOURCES + 1:
             break
-
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         pages = list(ex.map(lambda m: fetch_page(m["link"]), members))
+    infos = []
+    for m, (text, pimg) in zip(members, pages):
+        facts = text if len(text) > len(m["summary"]) else m["summary"]
+        infos.append((m, facts, pimg))
+    infos.sort(key=lambda x: len(x[1]), reverse=True)
 
     # an image is mandatory: check this first so no AI time is wasted
-    imgs = pick_images(members, cl, [p[1] for p in pages])
-    if not imgs:
+    img = pick_image(infos, cl)
+    if not img:
         note(f"[{cat}] SKIPPED (no working image found): {lead}")
         return None
 
-    blocks, total = [], 0
-    for n, (m, (text, _)) in enumerate(zip(members, pages), 1):
-        facts = (text if len(text) > len(m["summary"]) else m["summary"])[:1800]
-        total += len(facts)
-        blocks.append(f"SOURCE {n} - {m['source']}\nHeadline: {m['title']}\nSummary: {m['summary'][:400]}\nDetails: {facts}")
-    if total < 350:
+    infos = [i for i in infos if len(i[1]) >= 120][:MAX_SOURCES]
+    total = sum(len(i[1]) for i in infos)
+    if total < 400:
         note(f"[{cat}] SKIPPED (too little source text, {total} chars): {lead}")
         return None
+    chosen = [i[0] for i in infos]
 
-    src = " ".join([m["title"] + " " + m["summary"] for m in cl] + [p[0] for p in pages])
-    outlets = ", ".join(m["source"] for m in members)
-    ads = ads_available()
+    def block(n, m, facts, limit):
+        return f"SOURCE {n} - {m['source']}\nHeadline: {m['title']}\nSummary: {m['summary'][:400]}\nDetails: {facts[:limit]}"
+
+    research_blocks = "\n\n".join(block(n, m, f, 2000) for n, (m, f, _) in enumerate(infos, 1))
+    writer_blocks = "\n\n".join(block(n, m, f, 1200) for n, (m, f, _) in enumerate(infos, 1))
+    outlets = ", ".join(m["source"] for m in chosen)
+
+    gn_rel = best["rel"] if best else []
+    gn_lines = "\n".join(f"- {h} ({o})" for h, o in gn_rel) or "- none"
+
+    # pass 1: research / fact sheet
     t0 = time.time()
-    raw = llm(SYSTEM, make_prompt(cat, "\n\n".join(blocks), outlets, ads))
-    log(f"AI finished in {time.time() - t0:.0f}s, {len(raw.split())} words")
-    parsed = parse_output(raw, lead)
-    if not parsed:
+    fact_sheet = llm(RESEARCH_SYS, research_prompt(research_blocks), num_predict=900, temp=0.2).strip()
+    log(f"research pass: {time.time() - t0:.0f}s, {len(fact_sheet.split())} words")
+    if len(fact_sheet) < 200:
+        fact_sheet = "(not available - rely on the source excerpts)"
+
+    # pass 2: writing (AI chooses the structure)
+    ads = ads_available()
+    recent = ", ".join(st["formats"][-6:]) or "none yet"
+    t0 = time.time()
+    raw = llm(WRITER_SYS, writer_prompt(cat, fact_sheet, writer_blocks, outlets, gn_lines, recent, ads),
+              num_predict=3000, temp=0.8)
+    log(f"writing pass: {time.time() - t0:.0f}s, {len(raw.split())} words")
+    p = parse_output(raw, lead)
+    if not p:
         note(f"[{cat}] SKIPPED (AI output unusable): {lead}")
         return None
-    title, desc, body = parsed
-
-    if is_dup([toks(title)], st):
-        note(f"[{cat}] SKIPPED (generated title duplicates an earlier post): {title}")
+    if is_dup([toks(p["title"])], st):
+        note(f"[{cat}] SKIPPED (generated title duplicates an earlier post): {p['title']}")
         return None
 
-    soup = sanitize(body)
-    fact_check(soup, src)
-    words = len(soup.get_text().split())
+    src = " ".join([m["title"] + " " + m["summary"] for m in cl] + [i[1] for i in infos]
+                   + [h + " " + o for h, o in gn_rel])
+    body_soup = sanitize(p["body"])
+    fact_check(body_soup, src)
+    words = len(body_soup.get_text().split())
     if words < MIN_WORDS:
         note(f"[{cat}] SKIPPED (article only {words} words after checks): {lead}")
         return None
-    inner = soup.body.decode_contents() if soup.body else str(soup)
-    inner = place_ads(inner, ads)
-    return title, assemble(title, desc, inner, imgs, members)
+    sum_soup = sanitize(p["summary"])
+    fact_check(sum_soup, src)
+    summary_inner = inner_html(sum_soup)
+    if len(sum_soup.get_text().split()) < 8:
+        summary_inner = f"<p>{esc(p['desc'])}</p>"
+
+    faq = faq_pairs(body_soup)
+    body_inner = place_ads(inner_html(body_soup), ads)
+    related = related_block(st, cat, toks(p["title"]) | {k for kw in p["kws"] for k in toks(kw)})
+    html_out = assemble(cat, p, summary_inner, body_inner, img, chosen, words, related, faq)
+    tags = []
+    for k in p["kws"]:
+        k = re.sub(r"[,]", " ", k).strip()
+        if k and k.lower() != cat.lower() and k.lower() not in [t.lower() for t in tags]:
+            tags.append(k)
+    return {"title": p["title"], "html": html_out, "labels": [cat] + tags[:4], "fmt": p["fmt"], "words": words}
 
 
 def process(cat, st, trends):
@@ -762,14 +949,15 @@ def process(cat, st, trends):
     if not items:
         note(f"[{cat}] no fresh items in feeds")
         return False
+    gn = gn_signals(cat)
     ranked = []
     for c in cluster(items):
-        s, srcs, boost = score(c, trends)
-        ranked.append((s, srcs, boost, c))
+        s, srcs, boost, best = score(c, trends, gn)
+        ranked.append((s, srcs, boost, best, c))
     ranked.sort(key=lambda x: x[0], reverse=True)
 
     tried = 0
-    for s, srcs, boost, cl in ranked:
+    for s, srcs, boost, best, cl in ranked:
         if tried >= MAX_CLUSTER_TRIES:
             break
         titles = [m["title"] for m in cl]
@@ -777,17 +965,19 @@ def process(cat, st, trends):
             log(f"[{cat}] already covered: {titles[0]}")
             continue
         tried += 1
-        log(f"[{cat}] topic (score {s:.1f}, outlets {srcs}, trend boost {boost}): {titles[0]}")
-        res = build_post(cat, cl, st)
+        log(f"[{cat}] topic (score {s:.1f}, outlets {srcs}, trend boost {boost:.0f}, "
+            f"Google News match {'yes' if best else 'no'}): {titles[0]}")
+        res = build_post(cat, cl, st, best)
         ids = [m["id"] for m in cl]
         if not res:
             st["seen"].extend(ids)
             continue
-        url = blogger_post(res[0], res[1], cat)
+        url = blogger_post(res["title"], res["html"], res["labels"])
         st["seen"].extend(ids)
         st["write_ok"] = True
-        record_topic(st, cat, titles[:6], res[0])
-        note(f"POSTED [{cat}]: {res[0]} -> {url}")
+        st["formats"].append(res["fmt"])
+        record_topic(st, cat, titles[:6], res["title"], url)
+        note(f"POSTED [{cat}] ({res['words']} words, structure: {res['fmt']}): {res['title']} -> {url}")
         return True
     return False
 
