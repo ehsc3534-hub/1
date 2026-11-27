@@ -1,20 +1,13 @@
-name: News to Blogger (auto chain)
-run-name: News to Blogger (chain=${{ github.event.inputs.chain || 'true' }})
+name: News to Blogger (hourly)
+run-name: News to Blogger (${{ github.event_name }})
 
 on:
-  workflow_dispatch:
-    inputs:
-      chain:
-        description: "Keep posting automatically after each post? (false = only one post)"
-        type: choice
-        default: "true"
-        options:
-          - "true"
-          - "false"
+  schedule:
+    - cron: "7 * * * *"   # every hour at minute 7 (UTC)
+  workflow_dispatch:       # manual "Run workflow" button
 
 permissions:
   contents: write
-  actions: write
 
 concurrency:
   group: news-blogger
@@ -63,7 +56,6 @@ jobs:
           ollama pull "$OLLAMA_MODEL"
 
       - name: Create one post
-        id: run
         run: python main.py
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
@@ -87,9 +79,3 @@ jobs:
           git config user.email "news-bot@users.noreply.github.com"
           git add state.json
           git diff --cached --quiet || (git commit -m "state update" && git pull --rebase -q && git push)
-
-      - name: Trigger next run immediately
-        if: steps.run.outputs.next == 'true' && github.event.inputs.chain != 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run news-blogger.yml --ref ${{ github.ref_name }} -f chain=true
